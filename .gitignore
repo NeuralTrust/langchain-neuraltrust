@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Secrets — never commit live TrustGuard keys
+tests/**/.creds.json
+.env
+.env.*
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
