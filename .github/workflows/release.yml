@@ -1,5 +1,4 @@
-# Prod publish — a GitHub Release (from auto-release.yml) publishes the wheel
-# to the PROD Artifact Registry.
+# Prod publish — a GitHub Release (from auto-release.yml) uploads the wheel to PyPI.
 
 name: Release
 
@@ -17,11 +16,18 @@ permissions:
 
 jobs:
   publish:
-    uses: NeuralTrust/workflows/.github/workflows/python-publish.yml@ab9c0eda7ab13a6a7df5d04ecc048651c46c18cf
-    with:
-      gcp_project_id: ${{ vars.PROD_GCP_PROJECT_ID }}
-      build_tool: uv
-      python_version: "3.12"
-    secrets:
-      WIF_PROVIDER: ${{ secrets.PROD_WIF_PROVIDER }}
-      WIF_SERVICE_ACCOUNT: ${{ secrets.PROD_WIF_SERVICE_ACCOUNT }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: pypi
+      url: https://pypi.org/p/langchain-neuraltrust
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked --all-groups
+      - run: uv run pytest tests/unit_tests -q
+      - run: uv build
+      - run: uv publish --trusted-publishing always

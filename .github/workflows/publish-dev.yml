@@ -1,4 +1,4 @@
-# Dev publish — push to develop builds and publishes to the DEV Artifact Registry.
+# Dev publish — push to develop uploads a wheel to TestPyPI.
 # No GitHub Release is created.
 
 name: Publish Dev
@@ -20,11 +20,18 @@ permissions:
 
 jobs:
   publish:
-    uses: NeuralTrust/workflows/.github/workflows/python-publish.yml@ab9c0eda7ab13a6a7df5d04ecc048651c46c18cf
-    with:
-      gcp_project_id: ${{ vars.DEV_GCP_PROJECT_ID }}
-      build_tool: uv
-      python_version: "3.12"
-    secrets:
-      WIF_PROVIDER: ${{ secrets.DEV_WIF_PROVIDER }}
-      WIF_SERVICE_ACCOUNT: ${{ secrets.DEV_WIF_SERVICE_ACCOUNT }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/langchain-neuraltrust
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --locked --all-groups
+      - run: uv run pytest tests/unit_tests -q
+      - run: uv build
+      - run: uv publish --trusted-publishing always --publish-url https://test.pypi.org/legacy/

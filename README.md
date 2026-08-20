@@ -107,6 +107,6 @@ make typing
 make test-unit
 ```
 
-Releases follow the NeuralTrust Python library pipeline. Push to `develop` publishes a wheel to the **dev** Artifact Registry (`nt-python`). Push to `main` (or `master`) runs an AI semver bump of `langchain_neuraltrust/_version.py`, creates a GitHub Release, and publishes that tag to the **prod** registry.
+Releases follow the TrustTest flow, aimed at PyPI rather than Artifact Registry. Push to `develop` publishes a wheel to [TestPyPI](https://test.pypi.org/project/langchain-neuraltrust/). Push to `main` (or `master`) runs an AI semver bump of `langchain_neuraltrust/_version.py`, creates a GitHub Release, and publishes that tag to [PyPI](https://pypi.org/project/langchain-neuraltrust/).
 
 Live tests against the prod demo tenant run only when `tests/integration_tests/.creds.json` is present (gitignored). The `langchain-demo-*` collectors reuse the demo policies: allow is a no-op, block/report trigger on the keyword `forbidden`, and transform redacts an SSN such as `123-45-6789`.

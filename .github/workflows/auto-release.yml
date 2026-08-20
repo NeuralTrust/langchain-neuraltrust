@@ -1,6 +1,6 @@
 # Auto-release on the default branch.
 # AI semver bump, writes hatch's _version.py, creates a GitHub Release.
-# The release event then triggers release.yml to publish to PROD Artifact Registry.
+# The release event then triggers release.yml to publish to PyPI.
 #
 # .github changes are ignored so workflow-only pushes do not cut a release.
 
