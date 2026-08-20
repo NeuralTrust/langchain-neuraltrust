@@ -1,33 +1,63 @@
+# CI for PRs and default-branch pushes.
+# Uses NeuralTrust/workflows reusable jobs. This will not run from a personal
+# fork until the repo lives in the NeuralTrust org.
+# Workflows are pinned to a SHA of NeuralTrust/workflows@main.
+
 name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, develop]
   pull_request:
+    branches: [main, master, develop]
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          python-version: "3.12"
-      - run: uv sync --group lint --group typing --group test
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run mypy langchain_neuraltrust
+    if: github.event.action != 'edited'
+    uses: NeuralTrust/workflows/.github/workflows/tests.yml@ab9c0eda7ab13a6a7df5d04ecc048651c46c18cf
+    with:
+      language: python
+      language_version: "3.12"
+      test_enabled: false
+      uv_sync_args: --locked --all-groups
+      lint_command: uv run ruff check . && uv run ruff format --check . && uv run mypy langchain_neuraltrust
 
-  test:
-    runs-on: ubuntu-latest
+  security:
+    if: github.event.action != 'edited'
+    uses: NeuralTrust/workflows/.github/workflows/sast.yml@ab9c0eda7ab13a6a7df5d04ecc048651c46c18cf
+    with:
+      bandit_enabled: true
+      bandit_path: langchain_neuraltrust
+      pip_audit_enabled: true
+
+  tests:
+    if: github.event.action != 'edited'
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-      - run: uv sync --group test
-      - run: uv run pytest tests/unit_tests
+        language_version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    uses: NeuralTrust/workflows/.github/workflows/tests.yml@ab9c0eda7ab13a6a7df5d04ecc048651c46c18cf
+    with:
+      language: python
+      language_version: ${{ matrix.language_version }}
+      lint_enabled: false
+      uv_sync_args: --locked --all-groups
+      test_command: uv run pytest tests/unit_tests -v --tb=short
+
+  pr_metadata_validation:
+    if: github.event_name == 'pull_request'
+    uses: NeuralTrust/workflows/.github/workflows/pr-metadata.yml@ab9c0eda7ab13a6a7df5d04ecc048651c46c18cf

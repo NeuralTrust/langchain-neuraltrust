@@ -18,6 +18,6 @@ test-unit:
 	uv run pytest tests/unit_tests
 
 test-live:
-	uv run pytest tests/integration_tests
+	uv run pytest tests/integration_tests -m live
 
 test: test-unit

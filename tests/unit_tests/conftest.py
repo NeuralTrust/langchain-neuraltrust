@@ -10,6 +10,8 @@ ENV_KEYS = (
     "TRUSTGUARD_API_BASE",
     "TRUSTGUARD_COLLECTOR_KEY",
     "TRUSTGUARD_SESSION_ID",
+    "TRUSTGUARD_MODEL_NAME",
+    "TRUSTGUARD_TIMEOUT",
 )
 
 
@@ -24,3 +26,13 @@ def _clear_trustguard_env() -> Iterator[None]:
             os.environ.pop(key, None)
         else:
             os.environ[key] = value
+
+
+@pytest.fixture(autouse=True)
+def _fast_retries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("langchain_neuraltrust._client.time.sleep", lambda _s: None)
+
+    async def _no_sleep(_s: float) -> None:
+        return None
+
+    monkeypatch.setattr("langchain_neuraltrust._client.asyncio.sleep", _no_sleep)

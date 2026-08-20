@@ -6,7 +6,14 @@ from typing import Any
 import httpx
 import pytest
 import respx
-from langchain.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+from langchain.agents.middleware import AgentMiddleware
+from langchain.messages import (
+    AIMessage,
+    HumanMessage,
+    RemoveMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain.tools.tool_node import ToolCallRequest
 from langgraph.errors import GraphInterrupt
 
@@ -125,7 +132,9 @@ def test_allow_output_returns_none() -> None:
 @respx.mock
 def test_report_fires_callback_and_attaches_metadata() -> None:
     seen: list[tuple[str, str]] = []
-    respx.post(URL).mock(return_value=_status("report", findings=[{"id": 1}], trace_id="tr-r"))
+    respx.post(URL).mock(
+        return_value=_status("report", findings=[{"id": 1}], trace_id="tr-r")
+    )
     human = HumanMessage(content="hi", id="hm-1")
     result = _mw(on_violation=lambda v, s: seen.append((v.status, s))).before_model(
         _state(human),
@@ -145,7 +154,31 @@ def test_block_input_end() -> None:
     result = _mw().before_model(_state(HumanMessage(content="bad")), runtime=None)  # type: ignore[arg-type]
     assert result is not None
     assert result["jump_to"] == "end"
-    assert BLOCKED in result["messages"][0].content
+    assert BLOCKED in result["messages"][-1].content
+
+
+@respx.mock
+def test_block_input_end_keeps_prior_turns() -> None:
+    respx.post(URL).mock(return_value=_status("block"))
+    result = _mw().before_model(
+        _state(
+            SystemMessage(content="sys", id="sys"),
+            HumanMessage(content="h1", id="h1"),
+            AIMessage(content="a1", id="a1"),
+            HumanMessage(content="h2", id="h2"),
+        ),
+        runtime=None,  # type: ignore[arg-type]
+    )
+    assert result is not None
+    assert result["jump_to"] == "end"
+    removed = {
+        message.id for message in result["messages"] if isinstance(message, RemoveMessage)
+    }
+    assert removed == {"h2"}
+    assert not any(
+        isinstance(message, RemoveMessage) and message.id == "h1"
+        for message in result["messages"]
+    )
 
 
 @respx.mock
@@ -173,14 +206,18 @@ def test_block_input_replace() -> None:
 def test_block_output_end() -> None:
     respx.post(URL).mock(return_value=_status("block"))
     ai = AIMessage(content="RAW-UNSAFE-OUTPUT", id="ai-unsafe")
-    result = _mw().after_model(_state(HumanMessage(content="hi", id="h1"), ai), runtime=None)  # type: ignore[arg-type]
+    result = _mw().after_model(
+        _state(HumanMessage(content="hi", id="h1"), ai), runtime=None
+    )  # type: ignore[arg-type]
     assert result is not None
     assert result["jump_to"] == "end"
     ids = [message.id for message in result["messages"]]
     types = [type(message) for message in result["messages"]]
     assert RemoveMessage in types
     assert "ai-unsafe" in ids
-    assert any(BLOCKED in str(getattr(message, "content", "")) for message in result["messages"])
+    assert any(
+        BLOCKED in str(getattr(message, "content", "")) for message in result["messages"]
+    )
 
 
 @respx.mock
@@ -211,8 +248,28 @@ def test_transform_output() -> None:
 
 
 @respx.mock
+def test_input_form_transform_on_thread_fails_closed() -> None:
+    respx.post(URL).mock(
+        return_value=_status("transform", transformed_payload={"input": "[REDACTED]"})
+    )
+    result = _mw().before_model(
+        _state(
+            HumanMessage(content="my ssn is 123-45-6789", id="h1"),
+            AIMessage(content="Noted.", id="a1"),
+            HumanMessage(content="continue", id="h2"),
+        ),
+        runtime=None,  # type: ignore[arg-type]
+    )
+    assert result is not None
+    assert result["jump_to"] == "end"
+    assert result["messages"][-1].content == TRANSFORM_MISSING
+
+
+@respx.mock
 def test_unusable_transform_fails_closed() -> None:
-    respx.post(URL).mock(return_value=_status("transform", transformed_payload={"messages": []}))
+    respx.post(URL).mock(
+        return_value=_status("transform", transformed_payload={"messages": []})
+    )
     result = _mw().before_model(_state(HumanMessage(content="hi")), runtime=None)  # type: ignore[arg-type]
     assert result is not None
     assert result["jump_to"] == "end"
@@ -224,7 +281,9 @@ def test_multiblock_input_transform_fails_closed() -> None:
     respx.post(URL).mock(
         return_value=_status("transform", transformed_payload={"input": "[REDACTED]"})
     )
-    human = HumanMessage(content=[{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])
+    human = HumanMessage(
+        content=[{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]
+    )
     result = _mw().before_model(_state(human), runtime=None)  # type: ignore[arg-type]
     assert result is not None
     assert result["jump_to"] == "end"
@@ -235,7 +294,6 @@ def test_multiblock_input_transform_fails_closed() -> None:
     [
         (401, AUTH_FAILED),
         (403, AUTH_FAILED),
-        (429, REQUEST_FAILED),
         (503, ENTITLEMENTS),
     ],
 )
@@ -329,7 +387,9 @@ def test_unexpected_exception_fails_closed(monkeypatch: pytest.MonkeyPatch) -> N
 async def test_async_twins_allow_and_block() -> None:
     respx.post(URL).mock(return_value=_allow())
     mw = _mw()
-    assert await mw.abefore_model(_state(HumanMessage(content="hi")), runtime=None) is None  # type: ignore[arg-type]
+    assert (
+        await mw.abefore_model(_state(HumanMessage(content="hi")), runtime=None) is None
+    )  # type: ignore[arg-type]
     respx.post(URL).mock(return_value=_status("block"))
     result = await mw.aafter_model(_state(AIMessage(content="bad")), runtime=None)  # type: ignore[arg-type]
     assert result is not None
@@ -381,6 +441,32 @@ def test_wrap_tool_call_block_error() -> None:
     assert raised.value.stage == "tool_call"
 
 
+@respx.mock
+def test_wrap_tool_call_auth_error_raises_when_exit_behavior_error() -> None:
+    respx.post(URL).mock(return_value=httpx.Response(401, text="x"))
+    with pytest.raises(TrustGuardBlockedError) as raised:
+        _mw(check_tool_calls=True, exit_behavior="error").wrap_tool_call(
+            _tool_request(),
+            lambda _r: ToolMessage(content="ok", tool_call_id="c1"),
+        )
+    assert raised.value.stage == "tool_call"
+    assert AUTH_FAILED in str(raised.value)
+
+
+@respx.mock
+def test_wrap_tool_call_unusable_transform_raises_when_exit_behavior_error() -> None:
+    respx.post(URL).mock(
+        return_value=_status("transform", transformed_payload={"input": "nope"})
+    )
+    with pytest.raises(TrustGuardBlockedError) as raised:
+        _mw(check_tool_calls=True, exit_behavior="error").wrap_tool_call(
+            _tool_request(),
+            lambda _r: ToolMessage(content="ok", tool_call_id="c1"),
+        )
+    assert raised.value.stage == "tool_call"
+    assert TRANSFORM_MISSING in str(raised.value)
+
+
 @pytest.mark.asyncio
 @respx.mock
 async def test_awrap_tool_call_block() -> None:
@@ -396,25 +482,25 @@ async def test_awrap_tool_call_block() -> None:
 
 
 @respx.mock
-def test_wrap_tool_call_skipped_when_disabled() -> None:
-    route = respx.post(URL).mock(return_value=_status("block"))
-    request = _tool_request()
-    result = _mw(check_tool_calls=False).wrap_tool_call(
-        request,
-        lambda _r: ToolMessage(content="ok", tool_call_id="c1"),
-    )
-    assert route.call_count == 0
-    assert isinstance(result, ToolMessage)
-    assert result.content == "ok"
+def test_wrap_tool_call_not_registered_when_disabled() -> None:
+    mw = _mw(check_tool_calls=False)
+    assert mw.__class__.wrap_tool_call is AgentMiddleware.wrap_tool_call
+    assert mw.__class__.awrap_tool_call is AgentMiddleware.awrap_tool_call
+    gated = _mw(check_tool_calls=True)
+    assert gated.__class__.wrap_tool_call is not AgentMiddleware.wrap_tool_call
 
 
 @respx.mock
 def test_tool_results_block() -> None:
     respx.post(URL).mock(return_value=_status("block"))
     messages = [
-        HumanMessage(content="hi"),
-        AIMessage(content="", tool_calls=[{"name": "search", "args": {}, "id": "c1"}]),
-        ToolMessage(content="secret", tool_call_id="c1"),
+        HumanMessage(content="hi", id="h1"),
+        AIMessage(
+            content="",
+            id="a1",
+            tool_calls=[{"name": "search", "args": {}, "id": "c1"}],
+        ),
+        ToolMessage(content="secret", tool_call_id="c1", id="t1"),
     ]
     result = _mw(check_input=False, check_tool_results=True).before_model(
         _state(*messages),
@@ -422,6 +508,10 @@ def test_tool_results_block() -> None:
     )
     assert result is not None
     assert result["jump_to"] == "end"
+    removed = {
+        message.id for message in result["messages"] if isinstance(message, RemoveMessage)
+    }
+    assert removed == {"a1", "t1"}
 
 
 @respx.mock
@@ -527,19 +617,33 @@ def test_block_tool_results_replace_rewrites_all_siblings() -> None:
     respx.post(URL).mock(return_value=_status("block"))
     messages = [
         HumanMessage(content="hi"),
-        AIMessage(content="", tool_calls=[{"name": "get_ssn", "args": {}, "id": "c1"}]),
+        AIMessage(
+            content="",
+            id="a1",
+            tool_calls=[{"name": "get_ssn", "args": {}, "id": "c1"}],
+            additional_kwargs={"tool_calls": [{"id": "c1", "type": "function"}]},
+        ),
         ToolMessage(content="SSN 123-45-6789", tool_call_id="c1", id="t1"),
         ToolMessage(content="ok", tool_call_id="c2", id="t2"),
     ]
-    result = _mw(check_input=False, check_tool_results=True, exit_behavior="replace").before_model(
+    result = _mw(
+        check_input=False, check_tool_results=True, exit_behavior="replace"
+    ).before_model(
         _state(*messages),
         runtime=None,  # type: ignore[arg-type]
     )
     assert result is not None
+    updated_ai = result["messages"][1]
+    assert updated_ai.id == "a1"
+    assert updated_ai.content == BLOCKED
+    assert updated_ai.tool_calls == []
+    assert "tool_calls" not in updated_ai.additional_kwargs
     assert result["messages"][2].content == BLOCKED
     assert result["messages"][3].content == BLOCKED
     assert result["messages"][2].id == "t1"
     assert result["messages"][3].id == "t2"
+    assert not isinstance(result["messages"][2], ToolMessage)
+    assert not isinstance(result["messages"][3], ToolMessage)
 
 
 @respx.mock
@@ -562,7 +666,9 @@ def test_tool_results_fail_closed_error_keeps_stage() -> None:
         ToolMessage(content="secret", tool_call_id="c1"),
     ]
     with pytest.raises(TrustGuardBlockedError) as raised:
-        _mw(check_input=False, check_tool_results=True, exit_behavior="error").before_model(
+        _mw(
+            check_input=False, check_tool_results=True, exit_behavior="error"
+        ).before_model(
             _state(*messages),
             runtime=None,  # type: ignore[arg-type]
         )
@@ -643,3 +749,88 @@ def test_on_violation_interrupt_propagates() -> None:
             _state(HumanMessage(content="hi")),
             runtime=None,  # type: ignore[arg-type]
         )
+
+
+@respx.mock
+def test_session_id_falls_back_to_runtime_thread_id() -> None:
+    route = respx.post(URL).mock(return_value=_allow())
+    runtime = SimpleNamespace(config={"configurable": {"thread_id": "thread-9"}})
+    TrustGuardMiddleware(api_key="tgk_test", model_name="m").before_model(
+        _state(HumanMessage(content="hi")),
+        runtime=runtime,  # type: ignore[arg-type]
+    )
+    import json
+
+    parsed = json.loads(route.calls.last.request.read())
+    assert parsed["session_id"] == "thread-9"
+
+
+@respx.mock
+def test_check_input_and_tool_results_evaluate_once() -> None:
+    route = respx.post(URL).mock(return_value=_allow())
+    messages = [
+        HumanMessage(content="hi"),
+        AIMessage(content="", tool_calls=[{"name": "search", "args": {}, "id": "c1"}]),
+        ToolMessage(content="secret", tool_call_id="c1"),
+    ]
+    result = _mw(check_input=True, check_tool_results=True).before_model(
+        _state(*messages),
+        runtime=None,  # type: ignore[arg-type]
+    )
+    assert result is None
+    assert route.call_count == 1
+    import json
+
+    parsed = json.loads(route.calls.last.request.read())
+    roles = [item["role"] for item in parsed["payload"]["messages"]]
+    assert roles == ["user", "assistant", "tool"]
+
+
+@respx.mock
+def test_429_fail_open_after_retries() -> None:
+    respx.post(URL).mock(return_value=httpx.Response(429, text="slow"))
+    result = _mw(unreachable_fallback="fail_open").before_model(
+        _state(HumanMessage(content="hi")),
+        runtime=None,  # type: ignore[arg-type]
+    )
+    assert result is None
+
+
+@respx.mock
+def test_report_without_human_attaches_to_last_message() -> None:
+    respx.post(URL).mock(return_value=_status("report", findings=[{"id": 1}]))
+    ai = AIMessage(content="only-ai", id="a1")
+    result = _mw().before_model(_state(ai), runtime=None)  # type: ignore[arg-type]
+    assert result is not None
+    assert result["messages"][0].additional_kwargs["trustguard"]["status"] == "report"
+
+
+@respx.mock
+def test_session_id_prefers_execution_info_thread_id() -> None:
+    route = respx.post(URL).mock(return_value=_allow())
+    runtime = SimpleNamespace(
+        execution_info=SimpleNamespace(thread_id="exec-thread"),
+        config={"configurable": {"thread_id": "config-thread"}},
+    )
+    TrustGuardMiddleware(api_key="tgk_test", model_name="m").before_model(
+        _state(HumanMessage(content="hi")),
+        runtime=runtime,  # type: ignore[arg-type]
+    )
+    import json
+
+    parsed = json.loads(route.calls.last.request.read())
+    assert parsed["session_id"] == "exec-thread"
+
+
+@respx.mock
+def test_model_name_from_dataclass_context() -> None:
+    route = respx.post(URL).mock(return_value=_allow())
+    runtime = SimpleNamespace(context=SimpleNamespace(model="gpt-from-dataclass"))
+    TrustGuardMiddleware(api_key="tgk_test").before_model(
+        _state(HumanMessage(content="hi")),
+        runtime=runtime,  # type: ignore[arg-type]
+    )
+    import json
+
+    parsed = json.loads(route.calls.last.request.read())
+    assert parsed["attributes"]["model"]["name"] == "gpt-from-dataclass"

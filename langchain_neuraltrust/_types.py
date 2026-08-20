@@ -9,21 +9,29 @@ from typing import Final, Literal
 DEFAULT_API_BASE: Final = "https://trustguard.neuraltrust.ai"
 EVALUATE_PATH: Final = "/v1/evaluate"
 DEFAULT_TIMEOUT: Final = 5.0
+DEFAULT_MAX_RETRIES: Final = 2
 
 STATUS_ALLOW: Final = "allow"
 STATUS_BLOCK: Final = "block"
 STATUS_TRANSFORM: Final = "transform"
 STATUS_REPORT: Final = "report"
 
-KNOWN_STATUSES: Final = frozenset({STATUS_ALLOW, STATUS_BLOCK, STATUS_TRANSFORM, STATUS_REPORT})
+KNOWN_STATUSES: Final = frozenset(
+    {STATUS_ALLOW, STATUS_BLOCK, STATUS_TRANSFORM, STATUS_REPORT}
+)
 UNREACHABLE_HTTP_STATUSES: Final = frozenset({502, 504})
+RETRYABLE_HTTP_STATUSES: Final = frozenset({429, 502, 504})
 AUTH_HTTP_STATUSES: Final = frozenset({401, 403})
 
 TrustGuardStatus = Literal["allow", "block", "transform", "report"]
 ExitBehavior = Literal["end", "error", "replace"]
 UnreachableFallback = Literal["fail_closed", "fail_open"]
 EvaluateDirection = Literal["input", "output"]
+HookStage = Literal["input", "output", "tool"]
 ViolationStage = Literal["input", "output", "tool", "tool_call"]
+OutcomeKind = Literal[
+    "allow", "report", "block", "transform", "fail_closed", "fail_open", "reraise"
+]
 
 TRANSFORM_MISSING: Final = "TrustGuard transform missing payload"
 UNKNOWN_VERDICT: Final = "TrustGuard returned an unknown verdict"
@@ -31,7 +39,9 @@ UNREACHABLE: Final = "TrustGuard guardrail service unreachable"
 AUTH_FAILED: Final = "TrustGuard authentication failed"
 ENTITLEMENTS: Final = "TrustGuard entitlements unavailable"
 REQUEST_FAILED: Final = "TrustGuard request failed"
-MISSING_API_KEY: Final = "TrustGuard API key is required. Set TRUSTGUARD_API_KEY or pass api_key."
+MISSING_API_KEY: Final = (
+    "TrustGuard API key is required. Set TRUSTGUARD_API_KEY or pass api_key."
+)
 BLOCKED: Final = "Blocked by NeuralTrust TrustGuard."
 
 
@@ -67,7 +77,10 @@ class TrustGuardBlockedError(TrustGuardError):
 
 
 class TrustGuardUnreachableError(TrustGuardError):
-    """Transport failure eligible for ``unreachable_fallback`` (connect, timeout, 502/504)."""
+    """Transport failure eligible for ``unreachable_fallback``.
+
+    Covers connect errors, timeouts, HTTP 502/504, and exhausted HTTP 429 retries.
+    """
 
 
 class TrustGuardAuthError(TrustGuardError):
@@ -88,3 +101,7 @@ class TrustGuardUnknownVerdictError(TrustGuardError):
 
 class TrustGuardTransformError(TrustGuardError):
     """Unusable ``transformed_payload``. Always fail closed."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(TRANSFORM_MISSING)
+        self.reason = reason

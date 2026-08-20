@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, cast, get_args
 from urllib.parse import urlparse
 
 import httpx
@@ -16,13 +16,10 @@ from langchain_core.messages import (
     AIMessage,
     BaseMessage,
     HumanMessage,
-    RemoveMessage,
     SystemMessage,
     ToolMessage,
 )
-from langchain_core.messages.tool import ToolCall
 from langchain_core.utils.function_calling import convert_to_openai_tool
-from langgraph.errors import GraphBubbleUp
 from langgraph.runtime import Runtime
 from langgraph.types import Command
 
@@ -30,32 +27,25 @@ from langchain_neuraltrust._client import TrustGuardClient
 from langchain_neuraltrust._payload import (
     apply_transform_to_messages,
     apply_transform_to_tool_call,
+    end_messages,
     extract_input_payload,
     extract_output_payload,
     extract_tool_call_payload,
-    extract_tool_results_payload,
+    extract_tool_results,
     last_index_of,
-    tool_result_span,
+    neutralize,
 )
+from langchain_neuraltrust._policy import Outcome, classify_exception, classify_verdict
 from langchain_neuraltrust._types import (
-    BLOCKED,
     DEFAULT_API_BASE,
     DEFAULT_TIMEOUT,
     MISSING_API_KEY,
     REQUEST_FAILED,
-    STATUS_ALLOW,
-    STATUS_BLOCK,
-    STATUS_REPORT,
-    STATUS_TRANSFORM,
     TRANSFORM_MISSING,
-    UNKNOWN_VERDICT,
-    UNREACHABLE,
-    EvaluateDirection,
     ExitBehavior,
+    HookStage,
     TrustGuardBlockedError,
-    TrustGuardError,
     TrustGuardTransformError,
-    TrustGuardUnreachableError,
     TrustGuardVerdict,
     UnreachableFallback,
     ViolationStage,
@@ -65,39 +55,39 @@ OnViolation = Callable[[TrustGuardVerdict, ViolationStage], None]
 ToolCallResult = ToolMessage | Command[Any]
 ToolHandler = Callable[[ToolCallRequest], ToolCallResult]
 AsyncToolHandler = Callable[[ToolCallRequest], Awaitable[ToolCallResult]]
-EvaluateFn = Callable[[dict[str, Any]], TrustGuardVerdict]
-AEvaluateFn = Callable[[dict[str, Any]], Awaitable[TrustGuardVerdict]]
+GatedTool = ToolCallRequest | ToolMessage
+EvaluateBody = dict[str, Any]
+StageDriver = Generator[EvaluateBody, TrustGuardVerdict, dict[str, Any] | None]
 
 
 @dataclass(frozen=True, slots=True)
 class _EvalJob:
-    stage: ViolationStage
-    direction: EvaluateDirection
+    stage: HookStage
     payload: dict[str, Any]
-    span: tuple[int, int]
+    targets: tuple[int, ...]
+    end_targets: tuple[int, ...]
+    replace_targets: tuple[int, ...]
     replace_index: int | None
 
-
-@dataclass(frozen=True, slots=True)
-class _HookUpdate:
-    messages: list[BaseMessage] | None = None
-    jump_to: Literal["end"] | None = None
-
-    def as_dict(self) -> dict[str, Any] | None:
-        if self.jump_to is not None:
-            return {"jump_to": self.jump_to, "messages": self.messages or []}
-        if self.messages is not None:
-            return {"messages": self.messages}
-        return None
+    @property
+    def direction(self) -> str:
+        return "output" if self.stage == "output" else "input"
 
 
 @dataclass(frozen=True, slots=True)
-class _ToolDecision:
-    kind: Literal["proceed", "raise", "reject", "rewrite"]
-    tool_call: dict[str, Any] | None = None
-    message: ToolMessage | None = None
-    error: str | None = None
-    verdict: TrustGuardVerdict | None = None
+class _Jump:
+    messages: list[BaseMessage]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"jump_to": "end", "messages": self.messages}
+
+
+@dataclass(frozen=True, slots=True)
+class _Rewrite:
+    messages: list[BaseMessage]
+
+
+HookUpdate = _Jump | _Rewrite | None
 
 
 def _env(name: str) -> str | None:
@@ -105,13 +95,47 @@ def _env(name: str) -> str | None:
     return value if value else None
 
 
-class TrustGuardMiddleware(AgentMiddleware[AgentState[Any], Any]):
-    """Evaluate LangChain agent traffic with TrustGuard ``POST /v1/evaluate``.
+def _context_value(runtime: object | None, name: str) -> str:
+    if runtime is None:
+        return ""
+    context = getattr(runtime, "context", None)
+    if isinstance(context, Mapping):
+        value = context.get(name)
+    else:
+        value = getattr(context, name, None)
+    return value if isinstance(value, str) else ""
 
-    Hooks: ``before_model`` / ``abefore_model``, ``after_model`` / ``aafter_model``,
-    and optionally ``wrap_tool_call`` / ``awrap_tool_call``.
 
-    ``on_violation`` is invoked synchronously from both sync and async hooks.
+class TrustGuardMiddleware(AgentMiddleware[AgentState[Any], Any, Any]):
+    """Evaluate LangChain agent traffic with NeuralTrust TrustGuard.
+
+    Runs ``before_model`` / ``after_model`` (and their async twins) against
+    ``POST {api_base}/v1/evaluate``. Set ``check_tool_calls=True`` to also wrap
+    tool execution. ``on_violation`` is invoked synchronously from both sync and
+    async hooks.
+
+    Environment fallbacks: ``TRUSTGUARD_API_KEY``, ``TRUSTGUARD_API_BASE``,
+    ``TRUSTGUARD_COLLECTOR_KEY``, ``TRUSTGUARD_SESSION_ID``,
+    ``TRUSTGUARD_MODEL_NAME``, ``TRUSTGUARD_TIMEOUT``.
+
+    Example:
+        ```python
+        from langchain.agents import create_agent
+        from langchain_neuraltrust import TrustGuardMiddleware
+
+        agent = create_agent(
+            model="gpt-4o-mini",
+            tools=tools,
+            middleware=[
+                TrustGuardMiddleware(
+                    check_input=True,
+                    check_output=True,
+                    payload_tools=tools,
+                )
+            ],
+        )
+        result = agent.invoke({"messages": [("human", "Hello")]})
+        ```
     """
 
     def __init__(
@@ -128,7 +152,7 @@ class TrustGuardMiddleware(AgentMiddleware[AgentState[Any], Any]):
         check_tool_calls: bool = False,
         exit_behavior: ExitBehavior = "end",
         unreachable_fallback: UnreachableFallback = "fail_closed",
-        timeout: float = DEFAULT_TIMEOUT,
+        timeout: float | None = None,
         payload_tools: Sequence[object] | None = None,
         client: httpx.Client | None = None,
         async_client: httpx.AsyncClient | None = None,
@@ -137,40 +161,60 @@ class TrustGuardMiddleware(AgentMiddleware[AgentState[Any], Any]):
         """Create the middleware.
 
         Args:
-            api_key: TrustGuard API key (``tgk_...``). Falls back to ``TRUSTGUARD_API_KEY``.
-            api_base: TrustGuard base URL. Falls back to ``TRUSTGUARD_API_BASE``, then
-                ``https://trustguard.neuraltrust.ai``.
+            api_key: TrustGuard API key (``tgk_...``). Falls back to
+                ``TRUSTGUARD_API_KEY``.
+            api_base: TrustGuard base URL. Falls back to ``TRUSTGUARD_API_BASE``,
+                then ``https://trustguard.neuraltrust.ai``.
             collector_key: Optional collector key (``tgcol_...``). Falls back to
                 ``TRUSTGUARD_COLLECTOR_KEY``.
-            session_id: Optional session id forwarded as ``session_id``. Falls back to
-                ``TRUSTGUARD_SESSION_ID``.
+            session_id: Optional session id forwarded as ``session_id``. Falls
+                back to ``TRUSTGUARD_SESSION_ID``, then
+                ``runtime.execution_info.thread_id``.
             model_name: Optional model name sent in ``attributes.model.name``.
+                Falls back to ``TRUSTGUARD_MODEL_NAME``, then runtime context.
             check_input: Evaluate conversation messages in ``before_model``.
             check_output: Evaluate the last AI message in ``after_model``.
-            check_tool_results: Evaluate tool outputs in ``before_model``.
-            check_tool_calls: Gate tool execution in ``wrap_tool_call``.
-            exit_behavior: How to handle ``block`` (and fail-closed errors):
-                ``end``, ``error``, or ``replace``.
-            unreachable_fallback: ``fail_closed`` or ``fail_open`` for connect errors,
-                timeouts, and HTTP 502/504 only.
-            timeout: HTTP timeout in seconds.
-            payload_tools: Optional JSON-serializable OpenAI tool dicts, or LangChain
-                tools (converted at construction). Arbitrary objects fail construction.
-            client: Optional ``httpx.Client`` for connection reuse, proxies, or tests.
-            async_client: Optional ``httpx.AsyncClient`` for the same. Owned clients are
-                recreated if the event loop changes.
+            check_tool_results: Evaluate tool outputs in ``before_model``. Skipped
+                when ``check_input`` is also true, because the conversation
+                payload already includes those tool messages.
+            check_tool_calls: Gate tool execution in ``wrap_tool_call``. When
+                false, those methods are not registered on the class.
+            exit_behavior: How to handle ``block`` and fail-closed errors:
+                ``end``, ``error``, or ``replace``. The same value applies to
+                hooks and ``wrap_tool_call``.
+            unreachable_fallback: ``fail_closed`` or ``fail_open`` for connect
+                errors, timeouts, HTTP 502/504, and exhausted HTTP 429 retries.
+            timeout: HTTP timeout in seconds. Falls back to
+                ``TRUSTGUARD_TIMEOUT``, then ``5.0``.
+            payload_tools: Optional JSON-serializable OpenAI tool dicts, or
+                LangChain tools (converted at construction). Do not pass this as
+                ``tools``: ``AgentMiddleware.tools`` is reserved by
+                ``create_agent``.
+            client: Optional ``httpx.Client`` for connection reuse, proxies, or
+                tests.
+            async_client: Optional ``httpx.AsyncClient`` for the same. Owned
+                clients are keyed per event loop.
             on_violation: Optional callback for report/block/transform verdicts.
-                Called synchronously from both ``invoke`` and ``ainvoke``. Exceptions
-                from this callback propagate and are not mapped to a TrustGuard failure.
+                Called synchronously from both ``invoke`` and ``ainvoke``.
+                Exceptions from this callback propagate and are not mapped to a
+                TrustGuard failure.
         """
         super().__init__()
         resolved_key = api_key or _env("TRUSTGUARD_API_KEY")
         if not resolved_key:
             raise ValueError(MISSING_API_KEY)
-        if exit_behavior not in ("end", "error", "replace"):
+        if exit_behavior not in get_args(ExitBehavior):
             raise ValueError("exit_behavior must be 'end', 'error', or 'replace'")
-        if unreachable_fallback not in ("fail_closed", "fail_open"):
+        if unreachable_fallback not in get_args(UnreachableFallback):
             raise ValueError("unreachable_fallback must be 'fail_closed' or 'fail_open'")
+
+        env_timeout = _env("TRUSTGUARD_TIMEOUT")
+        if timeout is not None:
+            resolved_timeout = float(timeout)
+        elif env_timeout:
+            resolved_timeout = float(env_timeout)
+        else:
+            resolved_timeout = DEFAULT_TIMEOUT
 
         self.api_key = resolved_key
         self.api_base = _validated_api_base(
@@ -178,14 +222,14 @@ class TrustGuardMiddleware(AgentMiddleware[AgentState[Any], Any]):
         )
         self.collector_key = collector_key or _env("TRUSTGUARD_COLLECTOR_KEY") or ""
         self.session_id = session_id or _env("TRUSTGUARD_SESSION_ID") or ""
-        self.model_name = model_name or ""
+        self.model_name = model_name or _env("TRUSTGUARD_MODEL_NAME") or ""
         self.check_input = check_input
         self.check_output = check_output
         self.check_tool_results = check_tool_results
         self.check_tool_calls = check_tool_calls
         self.exit_behavior: ExitBehavior = exit_behavior
         self.unreachable_fallback: UnreachableFallback = unreachable_fallback
-        self.timeout = float(timeout)
+        self.timeout = resolved_timeout
         self.payload_tools = _coerce_payload_tools(payload_tools)
         self.on_violation = on_violation
         self._client = TrustGuardClient(
@@ -195,14 +239,15 @@ class TrustGuardMiddleware(AgentMiddleware[AgentState[Any], Any]):
             client=client,
             async_client=async_client,
         )
+        if check_tool_calls:
+            self.__class__ = _TrustGuardToolCallMiddleware  # noqa: PLC3002
 
-    def evaluate_body(
+    def _evaluate_body(
         self,
         payload: dict[str, Any],
-        direction: EvaluateDirection,
+        direction: str,
         runtime: object | None = None,
     ) -> dict[str, Any]:
-        """Build the TrustGuard evaluate request body."""
         body: dict[str, Any] = {
             "payload": payload,
             "direction": direction,
@@ -214,27 +259,61 @@ class TrustGuardMiddleware(AgentMiddleware[AgentState[Any], Any]):
         }
         if self.collector_key:
             body["collector_key"] = self.collector_key
-        if self.session_id:
-            body["session_id"] = self.session_id
+        session_id = self._session_id(runtime)
+        if session_id:
+            body["session_id"] = session_id
         return body
 
     @hook_config(can_jump_to=["end"])
-    def before_model(self, state: AgentState[Any], runtime: Runtime[Any]) -> dict[str, Any] | None:
-        """Evaluate input and optional tool results before the model is called."""
-        return self._run_stages(state, runtime, self._before_stage_names(), self._client.evaluate)
+    def before_model(
+        self, state: AgentState[Any], runtime: Runtime[Any]
+    ) -> dict[str, Any] | None:
+        """Evaluate input and optional tool results before the model is called.
+
+        Args:
+            state: Agent state containing ``messages``.
+            runtime: LangGraph runtime.
+
+        Returns:
+            A state update, or ``None`` when the conversation is unchanged.
+        """
+        return _drive(
+            self._stage_driver(
+                list(state.get("messages") or []), runtime, self._before_stage_names()
+            ),
+            self._client.evaluate,
+        )
 
     @hook_config(can_jump_to=["end"])
-    def after_model(self, state: AgentState[Any], runtime: Runtime[Any]) -> dict[str, Any] | None:
-        """Evaluate the last AI message after the model is called."""
-        return self._run_stages(state, runtime, self._after_stage_names(), self._client.evaluate)
+    def after_model(
+        self, state: AgentState[Any], runtime: Runtime[Any]
+    ) -> dict[str, Any] | None:
+        """Evaluate the last AI message after the model is called.
+
+        Args:
+            state: Agent state containing ``messages``.
+            runtime: LangGraph runtime.
+
+        Returns:
+            A state update, or ``None`` when the conversation is unchanged.
+        """
+        return _drive(
+            self._stage_driver(
+                list(state.get("messages") or []), runtime, self._after_stage_names()
+            ),
+            self._client.evaluate,
+        )
 
     @hook_config(can_jump_to=["end"])
     async def abefore_model(
         self, state: AgentState[Any], runtime: Runtime[Any]
     ) -> dict[str, Any] | None:
         """Async version of :meth:`before_model`."""
-        return await self._arun_stages(
-            state, runtime, self._before_stage_names(), self._client.aevaluate
+        return await _adrive(
+            self._stage_driver(
+                list(state.get("messages") or []), runtime, self._before_stage_names()
+            ),
+            self._client.aevaluate,
         )
 
     @hook_config(can_jump_to=["end"])
@@ -242,278 +321,172 @@ class TrustGuardMiddleware(AgentMiddleware[AgentState[Any], Any]):
         self, state: AgentState[Any], runtime: Runtime[Any]
     ) -> dict[str, Any] | None:
         """Async version of :meth:`after_model`."""
-        return await self._arun_stages(
-            state, runtime, self._after_stage_names(), self._client.aevaluate
+        return await _adrive(
+            self._stage_driver(
+                list(state.get("messages") or []), runtime, self._after_stage_names()
+            ),
+            self._client.aevaluate,
         )
 
-    def wrap_tool_call(
-        self,
-        request: ToolCallRequest,
-        handler: ToolHandler,
-    ) -> ToolCallResult:
-        """Gate a tool call before it executes."""
-        if not self.check_tool_calls:
-            return handler(request)
-        decision = self._decide_tool(request, self._client.evaluate)
-        return self._apply_tool_decision(request, handler, decision)
-
-    async def awrap_tool_call(
-        self,
-        request: ToolCallRequest,
-        handler: AsyncToolHandler,
-    ) -> ToolCallResult:
-        """Async version of :meth:`wrap_tool_call`."""
-        if not self.check_tool_calls:
-            return await handler(request)
-        decision = await self._adecide_tool(request, self._client.aevaluate)
-        return await self._aapply_tool_decision(request, handler, decision)
-
-    def _before_stage_names(self) -> tuple[ViolationStage, ...]:
-        stages: list[ViolationStage] = []
-        if self.check_tool_results:
+    def _before_stage_names(self) -> tuple[HookStage, ...]:
+        stages: list[HookStage] = []
+        if self.check_tool_results and not self.check_input:
             stages.append("tool")
         if self.check_input:
             stages.append("input")
         return tuple(stages)
 
-    def _after_stage_names(self) -> tuple[ViolationStage, ...]:
+    def _after_stage_names(self) -> tuple[HookStage, ...]:
         return ("output",) if self.check_output else ()
 
-    def _run_stages(
+    def _stage_driver(
         self,
-        state: AgentState[Any],
+        messages: list[BaseMessage],
         runtime: Runtime[Any],
-        stages: Sequence[ViolationStage],
-        evaluate: EvaluateFn,
-    ) -> dict[str, Any] | None:
-        messages: list[BaseMessage] = list(state.get("messages") or [])
-        if not stages or not messages:
-            return None
+        stages: Sequence[HookStage],
+    ) -> StageDriver:
         working = messages
+        if not stages or not working:
+            yield from ()
+            return None
         modified = False
         for stage in stages:
-            job = self._job_for(stage, working)
+            try:
+                job = self._job_for(stage, working)
+            except Exception as exc:
+                dummy = _EvalJob(stage, {}, tuple(range(len(working))), (), (), None)
+                update = self._render_hook(
+                    working,
+                    dummy,
+                    classify_exception(
+                        exc, unreachable_fallback=self.unreachable_fallback
+                    ),
+                )
+                working, early, changed = _consume_update(working, update)
+                if early is not None:
+                    return early
+                modified = modified or changed
+                continue
             if job is None:
                 continue
-            update = self._eval_job(job, working, runtime, evaluate)
-            if update is None:
-                continue
-            if update.jump_to is not None:
-                return update.as_dict()
-            if update.messages is not None:
-                working = update.messages
-                modified = True
-        if modified:
-            return {"messages": working}
-        return None
+            try:
+                verdict = yield self._evaluate_body(job.payload, job.direction, runtime)
+            except Exception as exc:
+                outcome = classify_exception(
+                    exc, unreachable_fallback=self.unreachable_fallback
+                )
+            else:
+                outcome = classify_verdict(verdict)
+            update = self._render_hook(working, job, outcome)
+            working, early, changed = _consume_update(working, update)
+            if early is not None:
+                return early
+            modified = modified or changed
+        return {"messages": working} if modified else None
 
-    async def _arun_stages(
-        self,
-        state: AgentState[Any],
-        runtime: Runtime[Any],
-        stages: Sequence[ViolationStage],
-        evaluate: AEvaluateFn,
-    ) -> dict[str, Any] | None:
-        messages: list[BaseMessage] = list(state.get("messages") or [])
-        if not stages or not messages:
-            return None
-        working = messages
-        modified = False
-        for stage in stages:
-            job = self._job_for(stage, working)
-            if job is None:
-                continue
-            update = await self._aeval_job(job, working, runtime, evaluate)
-            if update is None:
-                continue
-            if update.jump_to is not None:
-                return update.as_dict()
-            if update.messages is not None:
-                working = update.messages
-                modified = True
-        if modified:
-            return {"messages": working}
-        return None
-
-    def _job_for(self, stage: ViolationStage, messages: list[BaseMessage]) -> _EvalJob | None:
+    def _job_for(self, stage: HookStage, messages: list[BaseMessage]) -> _EvalJob | None:
         if stage == "tool":
-            payload = extract_tool_results_payload(messages)
-            start, end = tool_result_span(messages)
-            if payload is None or start is None or end is None:
+            extracted = extract_tool_results(messages)
+            if extracted is None:
                 return None
-            return _EvalJob(stage, "input", payload, (start, end), end - 1)
+            indices, payload = extracted
+            last_ai = last_index_of(messages, AIMessage)
+            block = (last_ai, *indices) if last_ai is not None else indices
+            return _EvalJob(stage, payload, indices, block, block, indices[-1])
         if stage == "input":
+            all_idx = tuple(range(len(messages)))
+            last_human = last_index_of(messages, HumanMessage)
+            end_targets = (
+                tuple(range(last_human, len(messages)))
+                if last_human is not None
+                else all_idx
+            )
             return _EvalJob(
                 stage,
-                "input",
                 extract_input_payload(messages, tools=self.payload_tools),
-                (0, len(messages)),
-                last_index_of(messages, HumanMessage),
+                all_idx,
+                end_targets,
+                all_idx,
+                last_human,
             )
-        payload = extract_output_payload(messages)
-        index = last_index_of(messages, AIMessage)
-        if payload is None or index is None:
+        if stage == "output":
+            output_payload = extract_output_payload(messages)
+            index = last_index_of(messages, AIMessage)
+            if output_payload is None or index is None:
+                return None
+            targets = (index,)
+            return _EvalJob(stage, output_payload, targets, targets, targets, index)
+        raise ValueError(f"unknown hook stage: {stage}")
+
+    def _render_hook(
+        self, messages: list[BaseMessage], job: _EvalJob, outcome: Outcome
+    ) -> HookUpdate:
+        if outcome.kind == "reraise":
+            if outcome.error is None:
+                raise TrustGuardBlockedError(REQUEST_FAILED, stage=job.stage)
+            raise outcome.error
+        if outcome.kind in {"allow", "fail_open"}:
             return None
-        return _EvalJob(stage, "output", payload, (index, index + 1), index)
-
-    def _eval_job(
-        self,
-        job: _EvalJob,
-        messages: list[BaseMessage],
-        runtime: Runtime[Any],
-        evaluate: EvaluateFn,
-    ) -> _HookUpdate | None:
-        try:
-            verdict = evaluate(self.evaluate_body(job.payload, job.direction, runtime))
-        except Exception as exc:
-            return self._recover_hook(exc, job, messages)
-        return self._apply_verdict(messages, verdict, job)
-
-    async def _aeval_job(
-        self,
-        job: _EvalJob,
-        messages: list[BaseMessage],
-        runtime: Runtime[Any],
-        evaluate: AEvaluateFn,
-    ) -> _HookUpdate | None:
-        try:
-            verdict = await evaluate(self.evaluate_body(job.payload, job.direction, runtime))
-        except Exception as exc:
-            return self._recover_hook(exc, job, messages)
-        return self._apply_verdict(messages, verdict, job)
-
-    def _apply_verdict(
-        self,
-        messages: list[BaseMessage],
-        verdict: TrustGuardVerdict,
-        job: _EvalJob,
-    ) -> _HookUpdate | None:
-        if verdict.status == STATUS_ALLOW:
-            return None
-        if verdict.status == STATUS_REPORT:
-            self._fire(verdict, job.stage)
-            return self._attach_report(messages, job.replace_index, verdict)
-        if verdict.status == STATUS_BLOCK:
-            return self._handle_block(messages, job=job, verdict=verdict)
-        if verdict.status != STATUS_TRANSFORM:
-            return self._fail_closed(
-                UNKNOWN_VERDICT,
-                verdict=verdict,
-                stage=job.stage,
-                messages=messages,
-                span=job.span,
+        if outcome.kind == "report":
+            if outcome.fire and outcome.verdict is not None:
+                self._fire(outcome.verdict, job.stage)
+            return self._attach_report(messages, job.replace_index, outcome.verdict)
+        if outcome.kind == "block":
+            if outcome.fire and outcome.verdict is not None:
+                self._fire(outcome.verdict, job.stage)
+            return self._handle_block(
+                messages, job=job, text=outcome.text, verdict=outcome.verdict
             )
-        self._fire(verdict, job.stage)
-        try:
-            rewritten = apply_transform_to_messages(
-                messages, verdict.transformed_payload, span=job.span
-            )
-        except TrustGuardTransformError:
-            return self._fail_closed(
-                TRANSFORM_MISSING,
-                verdict=verdict,
-                stage=job.stage,
-                messages=messages,
-                span=job.span,
-            )
-        return _HookUpdate(messages=rewritten)
-
-    def _decide_tool(self, request: ToolCallRequest, evaluate: EvaluateFn) -> _ToolDecision:
-        try:
-            verdict = evaluate(
-                self.evaluate_body(
-                    extract_tool_call_payload(request.tool_call), "input", request.runtime
+        if outcome.kind == "transform":
+            payload = outcome.verdict.transformed_payload if outcome.verdict else None
+            try:
+                rewritten = apply_transform_to_messages(
+                    messages, payload, indices=job.targets
                 )
-            )
-        except Exception as exc:
-            return self._recover_tool(exc, request)
-        return self._tool_decision(request, verdict)
-
-    async def _adecide_tool(self, request: ToolCallRequest, evaluate: AEvaluateFn) -> _ToolDecision:
-        try:
-            verdict = await evaluate(
-                self.evaluate_body(
-                    extract_tool_call_payload(request.tool_call), "input", request.runtime
+            except TrustGuardTransformError:
+                return self._fail_closed(
+                    TRANSFORM_MISSING,
+                    verdict=outcome.verdict,
+                    stage=job.stage,
+                    messages=messages,
+                    targets=job.end_targets,
                 )
-            )
-        except Exception as exc:
-            return self._recover_tool(exc, request)
-        return self._tool_decision(request, verdict)
-
-    def _tool_decision(self, request: ToolCallRequest, verdict: TrustGuardVerdict) -> _ToolDecision:
-        if verdict.status in {STATUS_ALLOW, STATUS_REPORT}:
-            if verdict.status == STATUS_REPORT:
-                self._fire(verdict, "tool_call")
-            return _ToolDecision(kind="proceed")
-        if verdict.status == STATUS_BLOCK:
-            self._fire(verdict, "tool_call")
-            if self.exit_behavior == "error":
-                return _ToolDecision(
-                    kind="raise", error=self._block_message(verdict), verdict=verdict
-                )
-            return _ToolDecision(
-                kind="reject", message=self._tool_error(request, self._block_message(verdict))
-            )
-        if verdict.status != STATUS_TRANSFORM:
-            return _ToolDecision(kind="reject", message=self._tool_error(request, UNKNOWN_VERDICT))
-        self._fire(verdict, "tool_call")
-        try:
-            return _ToolDecision(
-                kind="rewrite",
-                tool_call=apply_transform_to_tool_call(
-                    request.tool_call, verdict.transformed_payload
-                ),
-            )
-        except TrustGuardTransformError:
-            return _ToolDecision(
-                kind="reject", message=self._tool_error(request, TRANSFORM_MISSING)
-            )
-
-    def _apply_tool_decision(
-        self,
-        request: ToolCallRequest,
-        handler: ToolHandler,
-        decision: _ToolDecision,
-    ) -> ToolCallResult:
-        if decision.kind == "proceed":
-            return handler(request)
-        if decision.kind == "raise":
-            raise TrustGuardBlockedError(
-                decision.error or REQUEST_FAILED, verdict=decision.verdict, stage="tool_call"
-            )
-        if decision.kind == "rewrite" and decision.tool_call is not None:
-            return handler(self._with_tool_call(request, decision.tool_call))
-        return decision.message or self._tool_error(request, REQUEST_FAILED)
-
-    async def _aapply_tool_decision(
-        self,
-        request: ToolCallRequest,
-        handler: AsyncToolHandler,
-        decision: _ToolDecision,
-    ) -> ToolCallResult:
-        if decision.kind == "proceed":
-            return await handler(request)
-        if decision.kind == "raise":
-            raise TrustGuardBlockedError(
-                decision.error or REQUEST_FAILED, verdict=decision.verdict, stage="tool_call"
-            )
-        if decision.kind == "rewrite" and decision.tool_call is not None:
-            return await handler(self._with_tool_call(request, decision.tool_call))
-        return decision.message or self._tool_error(request, REQUEST_FAILED)
-
-    def _with_tool_call(
-        self, request: ToolCallRequest, tool_call: dict[str, Any]
-    ) -> ToolCallRequest:
-        return request.override(tool_call=cast(ToolCall, tool_call))
-
-    def _handle_unreachable(
-        self, error: TrustGuardUnreachableError, job: _EvalJob, messages: list[BaseMessage]
-    ) -> _HookUpdate | None:
-        if self.unreachable_fallback == "fail_open":
-            return None
+            if outcome.fire and outcome.verdict is not None:
+                self._fire(outcome.verdict, job.stage)
+            return _Rewrite(rewritten)
         return self._fail_closed(
-            str(error) or UNREACHABLE, stage=job.stage, messages=messages, span=job.span
+            outcome.text or REQUEST_FAILED,
+            verdict=outcome.verdict,
+            stage=job.stage,
+            messages=messages,
+            targets=job.end_targets,
         )
+
+    def _render_tool(self, request: ToolCallRequest, outcome: Outcome) -> GatedTool:
+        if outcome.kind == "reraise":
+            if outcome.error is None:
+                raise TrustGuardBlockedError(REQUEST_FAILED, stage="tool_call")
+            raise outcome.error
+        if outcome.kind in {"allow", "fail_open"}:
+            return request
+        if outcome.kind == "report":
+            if outcome.fire and outcome.verdict is not None:
+                self._fire(outcome.verdict, "tool_call")
+            return request
+        if outcome.kind == "block":
+            if outcome.fire and outcome.verdict is not None:
+                self._fire(outcome.verdict, "tool_call")
+            return self._tool_closed(request, outcome.text, outcome.verdict)
+        if outcome.kind == "transform":
+            payload = outcome.verdict.transformed_payload if outcome.verdict else None
+            try:
+                rewritten = apply_transform_to_tool_call(request.tool_call, payload)
+            except TrustGuardTransformError:
+                return self._tool_closed(request, TRANSFORM_MISSING, outcome.verdict)
+            if outcome.fire and outcome.verdict is not None:
+                self._fire(outcome.verdict, "tool_call")
+            return request.override(tool_call=rewritten)
+        return self._tool_closed(request, outcome.text or REQUEST_FAILED, outcome.verdict)
 
     def _fail_closed(
         self,
@@ -522,111 +495,103 @@ class TrustGuardMiddleware(AgentMiddleware[AgentState[Any], Any]):
         verdict: TrustGuardVerdict | None = None,
         stage: ViolationStage,
         messages: list[BaseMessage] | None = None,
-        span: tuple[int, int] | None = None,
-    ) -> _HookUpdate:
+        targets: tuple[int, ...] | None = None,
+    ) -> _Jump:
         if self.exit_behavior == "error":
             raise TrustGuardBlockedError(message, verdict=verdict, stage=stage)
-        if messages is not None and span is not None:
-            return _HookUpdate(messages=_end_messages(messages, span, message), jump_to="end")
-        return _HookUpdate(messages=[AIMessage(content=message)], jump_to="end")
+        if messages is not None and targets is not None:
+            return _Jump(end_messages(messages, targets, message))
+        return _Jump([AIMessage(content=message)])
 
-    def _recover_hook(
-        self, exc: BaseException, job: _EvalJob, messages: list[BaseMessage]
-    ) -> _HookUpdate | None:
-        if isinstance(exc, TrustGuardBlockedError | GraphBubbleUp):
-            raise exc
-        if isinstance(exc, TrustGuardUnreachableError):
-            return self._handle_unreachable(exc, job, messages)
-        if isinstance(exc, TrustGuardError):
-            return self._fail_closed(
-                str(exc) or REQUEST_FAILED, stage=job.stage, messages=messages, span=job.span
-            )
-        return self._fail_closed(REQUEST_FAILED, stage=job.stage, messages=messages, span=job.span)
-
-    def _recover_tool(self, exc: BaseException, request: ToolCallRequest) -> _ToolDecision:
-        if isinstance(exc, GraphBubbleUp):
-            raise exc
-        if isinstance(exc, TrustGuardBlockedError):
-            return _ToolDecision(kind="raise", error=str(exc), verdict=exc.verdict)
-        if isinstance(exc, TrustGuardUnreachableError):
-            if self.unreachable_fallback == "fail_open":
-                return _ToolDecision(kind="proceed")
-            return _ToolDecision(kind="reject", message=self._tool_error(request, UNREACHABLE))
-        if isinstance(exc, TrustGuardError):
-            return _ToolDecision(
-                kind="reject", message=self._tool_error(request, str(exc) or REQUEST_FAILED)
-            )
-        return _ToolDecision(kind="reject", message=self._tool_error(request, REQUEST_FAILED))
+    def _tool_closed(
+        self,
+        request: ToolCallRequest,
+        message: str,
+        verdict: TrustGuardVerdict | None = None,
+    ) -> ToolMessage:
+        if self.exit_behavior == "error":
+            raise TrustGuardBlockedError(message, verdict=verdict, stage="tool_call")
+        tool_call_id = str(request.tool_call.get("id") or "")
+        return ToolMessage(content=message, tool_call_id=tool_call_id, status="error")
 
     def _handle_block(
         self,
         messages: list[BaseMessage],
         *,
         job: _EvalJob,
-        verdict: TrustGuardVerdict,
-    ) -> _HookUpdate:
-        text = self._block_message(verdict)
-        self._fire(verdict, job.stage)
+        text: str,
+        verdict: TrustGuardVerdict | None,
+    ) -> HookUpdate:
         if self.exit_behavior == "error":
             raise TrustGuardBlockedError(text, verdict=verdict, stage=job.stage)
         if self.exit_behavior == "end":
-            return _HookUpdate(messages=_end_messages(messages, job.span, text), jump_to="end")
+            return _Jump(end_messages(messages, job.end_targets, text))
         working = list(messages)
-        start, end = job.span
-        for index in range(start, end):
+        for index in job.replace_targets:
             if isinstance(working[index], SystemMessage):
                 continue
-            working[index] = _neutralize(working[index], text)
-        return _HookUpdate(messages=working)
+            working[index] = neutralize(working[index], text)
+        return _Rewrite(working)
 
     def _attach_report(
         self,
         messages: list[BaseMessage],
         index: int | None,
-        verdict: TrustGuardVerdict,
-    ) -> _HookUpdate | None:
+        verdict: TrustGuardVerdict | None,
+    ) -> HookUpdate:
+        if verdict is None:
+            return None
+        if index is None:
+            index = next(
+                (
+                    i
+                    for i in range(len(messages) - 1, -1, -1)
+                    if not isinstance(messages[i], SystemMessage)
+                ),
+                len(messages) - 1 if messages else None,
+            )
         if index is None:
             return None
         working = list(messages)
         message = working[index]
         extra = dict(message.additional_kwargs)
         extra["trustguard"] = {
-            "status": STATUS_REPORT,
+            "status": verdict.status,
             "trace_id": verdict.trace_id,
             "request_id": verdict.request_id,
             "findings": verdict.findings,
         }
         working[index] = message.model_copy(update={"additional_kwargs": extra})
-        return _HookUpdate(messages=working)
-
-    def _block_message(self, verdict: TrustGuardVerdict) -> str:
-        if verdict.trace_id:
-            return f"{BLOCKED} trace_id={verdict.trace_id}"
-        return BLOCKED
+        return _Rewrite(working)
 
     def _fire(self, verdict: TrustGuardVerdict, stage: ViolationStage) -> None:
         if self.on_violation is None:
             return
         self.on_violation(verdict, stage)
 
-    def _tool_error(self, request: ToolCallRequest, content: str) -> ToolMessage:
-        tool_call_id = str(request.tool_call.get("id") or "")
-        return ToolMessage(content=content, tool_call_id=tool_call_id, status="error")
-
     def _model_name(self, runtime: object | None) -> str:
-        if self.model_name:
-            return self.model_name
+        return self.model_name or _context_value(runtime, "model")
+
+    def _session_id(self, runtime: object | None) -> str:
+        if self.session_id:
+            return self.session_id
         if runtime is None:
             return ""
-        context = getattr(runtime, "context", None)
-        if isinstance(context, dict):
-            model = context.get("model")
-            if isinstance(model, str):
-                return model
+        info = getattr(runtime, "execution_info", None)
+        thread_id = getattr(info, "thread_id", None)
+        if isinstance(thread_id, str) and thread_id:
+            return thread_id
+        config = getattr(runtime, "config", None)
+        if isinstance(config, Mapping):
+            configurable = config.get("configurable")
+            if isinstance(configurable, Mapping):
+                value = configurable.get("thread_id")
+                if isinstance(value, str) and value:
+                    return value
         return ""
 
     def close(self) -> None:
-        """Close owned HTTP clients."""
+        """Close owned HTTP clients. Prefer :meth:`aclose` after ``ainvoke``."""
         self._client.close()
 
     async def aclose(self) -> None:
@@ -634,11 +599,79 @@ class TrustGuardMiddleware(AgentMiddleware[AgentState[Any], Any]):
         await self._client.aclose()
 
 
-_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "[::1]"})
+class _TrustGuardToolCallMiddleware(TrustGuardMiddleware):
+    """Same middleware with ``wrap_tool_call`` registered for ``create_agent``."""
+
+    def wrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: ToolHandler,
+    ) -> ToolCallResult:
+        """Gate a tool call before it executes.
+
+        Args:
+            request: Pending tool call.
+            handler: Next wrapper or the tool.
+
+        Returns:
+            The handler result, or a ``ToolMessage(status="error")`` when blocked.
+        """
+        gated = self._gate_tool(request)
+        if isinstance(gated, ToolMessage):
+            return gated
+        return handler(gated)
+
+    async def awrap_tool_call(
+        self,
+        request: ToolCallRequest,
+        handler: AsyncToolHandler,
+    ) -> ToolCallResult:
+        """Async version of :meth:`wrap_tool_call`."""
+        gated = await self._agate_tool(request)
+        if isinstance(gated, ToolMessage):
+            return gated
+        return await handler(gated)
+
+    def _gate_tool(self, request: ToolCallRequest) -> GatedTool:
+        try:
+            verdict = self._client.evaluate(
+                self._evaluate_body(
+                    extract_tool_call_payload(request.tool_call),
+                    "input",
+                    request.runtime,
+                )
+            )
+        except Exception as exc:
+            return self._render_tool(
+                request,
+                classify_exception(exc, unreachable_fallback=self.unreachable_fallback),
+            )
+        return self._render_tool(request, classify_verdict(verdict))
+
+    async def _agate_tool(self, request: ToolCallRequest) -> GatedTool:
+        try:
+            verdict = await self._client.aevaluate(
+                self._evaluate_body(
+                    extract_tool_call_payload(request.tool_call),
+                    "input",
+                    request.runtime,
+                )
+            )
+        except Exception as exc:
+            return self._render_tool(
+                request,
+                classify_exception(exc, unreachable_fallback=self.unreachable_fallback),
+            )
+        return self._render_tool(request, classify_verdict(verdict))
+
+
+_LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 
 
 def _validated_api_base(url: str) -> str:
     parsed = urlparse(url)
+    if parsed.query or parsed.fragment or parsed.params or not parsed.hostname:
+        raise ValueError("TrustGuard api_base must be an https URL")
     if parsed.scheme == "https":
         return url.rstrip("/")
     if parsed.scheme == "http" and parsed.hostname in _LOCAL_HOSTS:
@@ -646,17 +679,17 @@ def _validated_api_base(url: str) -> str:
     raise ValueError("TrustGuard api_base must be an https URL")
 
 
-def _coerce_payload_tools(tools: Sequence[object] | None) -> list[object] | None:
+def _coerce_payload_tools(tools: Sequence[object] | None) -> list[dict[str, Any]] | None:
     if not tools:
         return None
-    converted: list[object] = []
+    converted: list[dict[str, Any]] = []
     for item in tools:
         if isinstance(item, Mapping):
             converted.append(dict(item))
             continue
         try:
             converted.append(convert_to_openai_tool(cast(Any, item)))
-        except Exception as exc:
+        except (TypeError, ValueError, AttributeError) as exc:
             raise ValueError(
                 "payload_tools must be JSON-serializable tool dicts or LangChain tools"
             ) from exc
@@ -667,22 +700,46 @@ def _coerce_payload_tools(tools: Sequence[object] | None) -> list[object] | None
     return converted
 
 
-def _neutralize(message: BaseMessage, text: str) -> BaseMessage:
-    updates: dict[str, Any] = {"content": text}
-    if isinstance(message, AIMessage):
-        updates["tool_calls"] = []
-        updates["invalid_tool_calls"] = []
-    return message.model_copy(update=updates)
+def _consume_update(
+    working: list[BaseMessage], update: HookUpdate
+) -> tuple[list[BaseMessage], dict[str, Any] | None, bool]:
+    if update is None:
+        return working, None, False
+    if isinstance(update, _Jump):
+        return working, update.as_dict(), False
+    return update.messages, None, True
 
 
-def _end_messages(
-    messages: Sequence[BaseMessage], span: tuple[int, int], text: str
-) -> list[BaseMessage]:
-    start, end = span
-    removals: list[BaseMessage] = []
-    for message in messages[start:end]:
-        if isinstance(message, SystemMessage):
-            continue
-        if message.id:
-            removals.append(RemoveMessage(id=message.id))
-    return [*removals, AIMessage(content=text)]
+def _drive(
+    driver: StageDriver, evaluate: Callable[[EvaluateBody], TrustGuardVerdict]
+) -> dict[str, Any] | None:
+    try:
+        body = next(driver)
+        while True:
+            try:
+                verdict = evaluate(body)
+            except Exception as exc:
+                body = driver.throw(exc)
+            else:
+                body = driver.send(verdict)
+    except StopIteration as done:
+        value = done.value
+        return value if value is None or isinstance(value, dict) else None
+
+
+async def _adrive(
+    driver: StageDriver,
+    evaluate: Callable[[EvaluateBody], Awaitable[TrustGuardVerdict]],
+) -> dict[str, Any] | None:
+    try:
+        body = next(driver)
+        while True:
+            try:
+                verdict = await evaluate(body)
+            except Exception as exc:
+                body = driver.throw(exc)
+            else:
+                body = driver.send(verdict)
+    except StopIteration as done:
+        value = done.value
+        return value if value is None or isinstance(value, dict) else None

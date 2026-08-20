@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import ssl
 import threading
-from collections.abc import Mapping
+import time
+from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, cast
 
 import httpx
@@ -13,10 +14,12 @@ import httpx
 from langchain_neuraltrust._types import (
     AUTH_FAILED,
     AUTH_HTTP_STATUSES,
+    DEFAULT_MAX_RETRIES,
     ENTITLEMENTS,
     EVALUATE_PATH,
     KNOWN_STATUSES,
     REQUEST_FAILED,
+    RETRYABLE_HTTP_STATUSES,
     UNKNOWN_VERDICT,
     UNREACHABLE,
     UNREACHABLE_HTTP_STATUSES,
@@ -33,6 +36,8 @@ from langchain_neuraltrust._version import __version__
 
 _USER_AGENT = f"langchain-neuraltrust/{__version__}"
 _UNREACHABLE_EXC = (httpx.TimeoutException, httpx.ConnectError)
+Send = Callable[[], httpx.Response]
+ASend = Callable[[], Awaitable[httpx.Response]]
 
 
 def _as_optional_str(value: object) -> str | None:
@@ -46,10 +51,6 @@ def _is_tls_failure(exc: BaseException) -> bool:
         seen.add(id(current))
         if isinstance(current, ssl.SSLError):
             return True
-        name = type(current).__name__.lower()
-        text = str(current).lower()
-        if "ssl" in name or "ssl" in text or "certificate verify" in text:
-            return True
         current = current.__cause__ or current.__context__
     return False
 
@@ -60,7 +61,7 @@ def _map_status_error(exc: httpx.HTTPStatusError) -> TrustGuardError:
         return TrustGuardAuthError(AUTH_FAILED)
     if status_code == 503:
         return TrustGuardEntitlementError(ENTITLEMENTS)
-    if status_code in UNREACHABLE_HTTP_STATUSES:
+    if status_code in UNREACHABLE_HTTP_STATUSES or status_code == 429:
         return TrustGuardUnreachableError(UNREACHABLE)
     return TrustGuardRequestError(REQUEST_FAILED)
 
@@ -77,7 +78,10 @@ def _map_request_error(exc: httpx.RequestError) -> TrustGuardError:
 
 
 def parse_evaluate_response(response: httpx.Response) -> TrustGuardVerdict:
-    """Parse a 2xx TrustGuard body. Non-JSON 200 is an unknown verdict, not unreachable."""
+    """Parse a 2xx TrustGuard body.
+
+    Non-JSON 200 is an unknown verdict, not unreachable.
+    """
     try:
         parsed: object = response.json()
     except ValueError as exc:
@@ -106,8 +110,38 @@ def _interpret_response(response: httpx.Response) -> TrustGuardVerdict:
     return parse_evaluate_response(response)
 
 
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    raw = response.headers.get("Retry-After")
+    if isinstance(raw, str):
+        try:
+            return min(float(raw), 5.0)
+        except ValueError:
+            pass
+    backoff = 0.25 * (2**attempt)
+    capped = 2.0 if backoff > 2.0 else backoff
+    return float(capped)
+
+
+def _close_async_client(client: httpx.AsyncClient) -> None:
+    if client.is_closed:
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            asyncio.run(client.aclose())
+        except RuntimeError:
+            return
+        return
+    loop.create_task(client.aclose())
+
+
 class TrustGuardClient:
-    """Thin wrapper around TrustGuard evaluate. Inject ``client`` / ``async_client`` in tests."""
+    """Thin wrapper around TrustGuard evaluate.
+
+    Inject ``client`` / ``async_client`` in tests. Owned async clients are keyed
+    per event loop so concurrent loops do not thrash a single slot.
+    """
 
     def __init__(
         self,
@@ -117,17 +151,17 @@ class TrustGuardClient:
         timeout: float,
         client: httpx.Client | None = None,
         async_client: httpx.AsyncClient | None = None,
+        max_retries: int = DEFAULT_MAX_RETRIES,
     ) -> None:
         self.api_key = api_key
         self.api_base = api_base.rstrip("/")
         self.timeout = timeout
-        self._owns_client = client is None
-        self._owns_async_client = async_client is None
-        self._client = client
-        self._async_client = async_client
-        self._async_loop: asyncio.AbstractEventLoop | None = None
+        self.max_retries = max_retries
+        self._injected_sync = client
+        self._injected_async = async_client
+        self._owned_sync: httpx.Client | None = None
+        self._owned_async: dict[int, httpx.AsyncClient] = {}
         self._sync_lock = threading.Lock()
-        self._async_lock = threading.Lock()
 
     @property
     def url(self) -> str:
@@ -142,85 +176,129 @@ class TrustGuardClient:
             "User-Agent": _USER_AGENT,
         }
 
+    def _post_kwargs(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "url": self.url,
+            "json": dict(body),
+            "headers": self.headers(),
+            "timeout": self.timeout,
+        }
+
     def evaluate(self, body: Mapping[str, Any]) -> TrustGuardVerdict:
-        """Call evaluate synchronously."""
-        try:
-            response = self._sync().post(
-                self.url,
-                json=dict(body),
-                headers=self.headers(),
-                timeout=self.timeout,
-            )
-        except httpx.RequestError as exc:
-            raise _map_request_error(exc) from exc
-        return _interpret_response(response)
+        """Call evaluate synchronously, retrying 429/502/504 and timeouts."""
+
+        def send() -> httpx.Response:
+            return self._sync_http().post(**self._post_kwargs(body))
+
+        return _interpret_response(self._retry_sync(send))
 
     async def aevaluate(self, body: Mapping[str, Any]) -> TrustGuardVerdict:
-        """Call evaluate asynchronously."""
-        try:
-            return await self._apost(body)
-        except RuntimeError:
-            if not self._owns_async_client:
-                raise
-            self._drop_async_client()
-            try:
-                return await self._apost(body)
-            except RuntimeError as exc:
-                raise TrustGuardRequestError(REQUEST_FAILED) from exc
+        """Call evaluate asynchronously, retrying 429/502/504 and timeouts."""
 
-    async def _apost(self, body: Mapping[str, Any]) -> TrustGuardVerdict:
-        try:
-            response = await self._async().post(
-                self.url,
-                json=dict(body),
-                headers=self.headers(),
-                timeout=self.timeout,
-            )
-        except httpx.RequestError as exc:
-            raise _map_request_error(exc) from exc
-        return _interpret_response(response)
+        async def send() -> httpx.Response:
+            return await self._async_http().post(**self._post_kwargs(body))
+
+        return _interpret_response(await self._retry_async(send))
 
     def close(self) -> None:
-        """Close the owned sync client."""
-        if self._owns_client and self._client is not None:
-            self._client.close()
-            self._client = None
+        """Close owned sync and async clients when possible."""
+        if self._injected_sync is None and self._owned_sync is not None:
+            self._owned_sync.close()
+            self._owned_sync = None
+        if self._injected_async is not None:
+            return
+        pending = list(self._owned_async.values())
+        self._owned_async = {}
+        for client in pending:
+            _close_async_client(client)
 
     async def aclose(self) -> None:
-        """Close the owned async client."""
-        if self._owns_async_client and self._async_client is not None:
-            await self._async_client.aclose()
-            self._async_client = None
-            self._async_loop = None
+        """Close owned async clients."""
+        if self._injected_async is not None:
+            return
+        pending = list(self._owned_async.values())
+        self._owned_async = {}
+        for client in pending:
+            if not client.is_closed:
+                await client.aclose()
 
-    def _sync(self) -> httpx.Client:
-        if not self._owns_client:
-            assert self._client is not None
-            return self._client
-        client = self._client
+    def _sync_http(self) -> httpx.Client:
+        if self._injected_sync is not None:
+            return self._injected_sync
+        client = self._owned_sync
         if client is None or client.is_closed:
             with self._sync_lock:
-                client = self._client
+                client = self._owned_sync
                 if client is None or client.is_closed:
-                    self._client = httpx.Client(timeout=self.timeout)
-        assert self._client is not None
-        return self._client
+                    client = httpx.Client(timeout=self.timeout)
+                    self._owned_sync = client
+        return client
 
-    def _async(self) -> httpx.AsyncClient:
-        if not self._owns_async_client:
-            assert self._async_client is not None
-            return self._async_client
+    def _async_http(self) -> httpx.AsyncClient:
+        if self._injected_async is not None:
+            return self._injected_async
         loop = asyncio.get_running_loop()
-        client = self._async_client
-        if client is None or client.is_closed or self._async_loop is not loop:
-            with self._async_lock:
-                client = self._async_client
-                if client is None or client.is_closed or self._async_loop is not loop:
-                    self._async_client = httpx.AsyncClient(timeout=self.timeout)
-                    self._async_loop = loop
-        assert self._async_client is not None
-        return self._async_client
+        key = id(loop)
+        client = self._owned_async.get(key)
+        if client is None or client.is_closed:
+            client = httpx.AsyncClient(timeout=self.timeout)
+            self._owned_async[key] = client
+        return client
 
-    def _drop_async_client(self) -> None:
-        self._async_client = None
-        self._async_loop = None
+    def _retry_sync(self, send: Send) -> httpx.Response:
+        last_error: TrustGuardError | None = None
+        last_response: httpx.Response | None = None
+        attempts = self.max_retries + 1
+        for attempt in range(attempts):
+            try:
+                response = send()
+            except httpx.RequestError as exc:
+                mapped = _map_request_error(exc)
+                last_error = mapped
+                if (
+                    isinstance(mapped, TrustGuardUnreachableError)
+                    and attempt < self.max_retries
+                ):
+                    time.sleep(_retry_delay(httpx.Response(0), attempt))
+                    continue
+                raise mapped from exc
+            last_response = response
+            if (
+                response.status_code in RETRYABLE_HTTP_STATUSES
+                and attempt < self.max_retries
+            ):
+                time.sleep(_retry_delay(response, attempt))
+                continue
+            return response
+        if last_response is not None:
+            return last_response
+        raise last_error or TrustGuardUnreachableError(UNREACHABLE)
+
+    async def _retry_async(self, send: ASend) -> httpx.Response:
+        last_error: TrustGuardError | None = None
+        last_response: httpx.Response | None = None
+        attempts = self.max_retries + 1
+        for attempt in range(attempts):
+            try:
+                response = await send()
+            except httpx.RequestError as exc:
+                mapped = _map_request_error(exc)
+                last_error = mapped
+                if (
+                    isinstance(mapped, TrustGuardUnreachableError)
+                    and attempt < self.max_retries
+                ):
+                    await asyncio.sleep(_retry_delay(httpx.Response(0), attempt))
+                    continue
+                raise mapped from exc
+            last_response = response
+            if (
+                response.status_code in RETRYABLE_HTTP_STATUSES
+                and attempt < self.max_retries
+            ):
+                await asyncio.sleep(_retry_delay(response, attempt))
+                continue
+            return response
+        if last_response is not None:
+            return last_response
+        raise last_error or TrustGuardUnreachableError(UNREACHABLE)

@@ -38,6 +38,15 @@ def test_constructor_overrides_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert middleware.collector_key == "tgcol_arg"
 
 
+def test_env_timeout_and_model_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRUSTGUARD_API_KEY", "tgk_env")
+    monkeypatch.setenv("TRUSTGUARD_TIMEOUT", "8.5")
+    monkeypatch.setenv("TRUSTGUARD_MODEL_NAME", "from-env")
+    middleware = TrustGuardMiddleware()
+    assert middleware.timeout == 8.5
+    assert middleware.model_name == "from-env"
+
+
 def test_default_api_base_and_timeout() -> None:
     middleware = TrustGuardMiddleware(api_key="tgk_test")
     assert middleware.api_base == DEFAULT_API_BASE
@@ -68,8 +77,20 @@ def test_http_api_base_rejected() -> None:
 
 
 def test_localhost_http_api_base_allowed() -> None:
-    middleware = TrustGuardMiddleware(api_key="tgk_test", api_base="http://localhost:8080/")
+    middleware = TrustGuardMiddleware(
+        api_key="tgk_test", api_base="http://localhost:8080/"
+    )
     assert middleware.api_base == "http://localhost:8080"
+
+
+def test_api_base_rejects_query_string() -> None:
+    with pytest.raises(ValueError, match="https"):
+        TrustGuardMiddleware(api_key="tgk_test", api_base="https://x.example?a=b")
+
+
+def test_api_base_rejects_missing_hostname() -> None:
+    with pytest.raises(ValueError, match="https"):
+        TrustGuardMiddleware(api_key="tgk_test", api_base="https:/x.example")
 
 
 def test_payload_tools_convert_langchain_tool() -> None:
@@ -82,7 +103,7 @@ def test_payload_tools_convert_langchain_tool() -> None:
 
     middleware = TrustGuardMiddleware(api_key="tgk_test", payload_tools=[search])
     assert middleware.payload_tools is not None
-    assert middleware.payload_tools[0]["function"]["name"] == "search"  # type: ignore[index]
+    assert middleware.payload_tools[0]["function"]["name"] == "search"
 
 
 def test_payload_tools_reject_arbitrary_objects() -> None:

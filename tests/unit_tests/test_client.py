@@ -60,7 +60,9 @@ def test_evaluate_parses_known_status() -> None:
 
 @respx.mock
 def test_evaluate_sends_bearer_and_json() -> None:
-    route = respx.post(URL).mock(return_value=httpx.Response(200, json={"status": "allow"}))
+    route = respx.post(URL).mock(
+        return_value=httpx.Response(200, json={"status": "allow"})
+    )
     _client().evaluate(_body())
     request = route.calls.last.request
     assert request.headers["Authorization"] == "Bearer tgk_test"
@@ -100,10 +102,23 @@ def test_bad_gateway_is_unreachable(status_code: int) -> None:
 
 
 @respx.mock
-def test_429_is_request_failed() -> None:
-    respx.post(URL).mock(return_value=httpx.Response(429, text="slow"))
-    with pytest.raises(TrustGuardRequestError, match=REQUEST_FAILED):
+def test_429_retries_then_unreachable() -> None:
+    route = respx.post(URL).mock(return_value=httpx.Response(429, text="slow"))
+    with pytest.raises(TrustGuardUnreachableError, match=UNREACHABLE):
         _client().evaluate(_body())
+    assert route.call_count == 3
+
+
+@respx.mock
+def test_429_then_allow_succeeds() -> None:
+    respx.post(URL).mock(
+        side_effect=[
+            httpx.Response(429, text="slow"),
+            httpx.Response(200, json={"status": "allow"}),
+        ]
+    )
+    verdict = _client().evaluate(_body())
+    assert verdict.status == "allow"
 
 
 @respx.mock
@@ -164,11 +179,16 @@ def test_decoding_error_is_unknown_verdict() -> None:
 
 @respx.mock
 def test_user_agent_includes_package_version() -> None:
-    route = respx.post(URL).mock(return_value=httpx.Response(200, json={"status": "allow"}))
+    route = respx.post(URL).mock(
+        return_value=httpx.Response(200, json={"status": "allow"})
+    )
     _client().evaluate(_body())
     from langchain_neuraltrust._version import __version__
 
-    assert route.calls.last.request.headers["User-Agent"] == f"langchain-neuraltrust/{__version__}"
+    assert (
+        route.calls.last.request.headers["User-Agent"]
+        == f"langchain-neuraltrust/{__version__}"
+    )
 
 
 def test_tls_error_is_request_failed_not_unreachable() -> None:
@@ -189,8 +209,33 @@ def test_async_client_is_recreated_for_a_new_event_loop() -> None:
     client = _client()
 
     async def grab() -> httpx.AsyncClient:
-        return client._async()
+        return client._async_http()
 
     first = asyncio.run(grab())
     second = asyncio.run(grab())
     assert first is not second
+    assert len(client._owned_async) == 2
+
+
+def test_connect_error_ssl_text_without_sslerror_is_unreachable() -> None:
+    from langchain_neuraltrust._client import _map_request_error
+
+    failure = httpx.ConnectError("certificate verify failed")
+    mapped = _map_request_error(failure)
+    assert isinstance(mapped, TrustGuardUnreachableError)
+
+
+@pytest.mark.asyncio
+async def test_aevaluate_does_not_retry_runtime_error() -> None:
+    client = _client()
+    calls = {"n": 0}
+
+    class _Boom(httpx.AsyncClient):
+        async def post(self, *args: object, **kwargs: object) -> httpx.Response:
+            calls["n"] += 1
+            raise RuntimeError("not a loop error, just boom")
+
+    client._injected_async = _Boom()
+    with pytest.raises(RuntimeError, match="not a loop error"):
+        await client.aevaluate(_body())
+    assert calls["n"] == 1

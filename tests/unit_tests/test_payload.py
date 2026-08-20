@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import ChatMessage
 
 from langchain_neuraltrust._payload import (
     apply_transform_to_messages,
@@ -11,6 +12,8 @@ from langchain_neuraltrust._payload import (
     extract_tool_call_payload,
     extract_tool_results_payload,
     message_to_payload,
+    role_of,
+    tool_result_indices,
 )
 from langchain_neuraltrust._types import TrustGuardTransformError
 
@@ -23,7 +26,11 @@ def test_extract_input_includes_tools_and_roles() -> None:
     ]
     tools = [{"type": "function", "function": {"name": "x"}}]
     payload = extract_input_payload(messages, tools=tools)
-    assert [item["role"] for item in payload["messages"]] == ["system", "user", "assistant"]
+    assert [item["role"] for item in payload["messages"]] == [
+        "system",
+        "user",
+        "assistant",
+    ]
     assert payload["tools"][0]["function"]["name"] == "x"
 
 
@@ -51,7 +58,9 @@ def test_extract_output_none_without_ai() -> None:
 def test_extract_tool_results() -> None:
     messages = [
         HumanMessage(content="hi"),
-        AIMessage(content="", tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "c1"}]),
+        AIMessage(
+            content="", tool_calls=[{"name": "search", "args": {"q": "x"}, "id": "c1"}]
+        ),
         ToolMessage(content="result", tool_call_id="c1", name="search"),
     ]
     payload = extract_tool_results_payload(messages)
@@ -62,7 +71,9 @@ def test_extract_tool_results() -> None:
 
 
 def test_extract_tool_call_payload() -> None:
-    payload = extract_tool_call_payload({"name": "search", "args": {"q": "x"}, "id": "c1"})
+    payload = extract_tool_call_payload(
+        {"name": "search", "args": {"q": "x"}, "id": "c1"}
+    )
     tool_calls = payload["messages"][0]["tool_calls"]
     assert tool_calls[0]["function"]["name"] == "search"
     assert tool_calls[0]["function"]["arguments"] == '{"q": "x"}'
@@ -127,7 +138,9 @@ def test_empty_transform_fails() -> None:
 def test_shorter_transform_fails() -> None:
     messages = [HumanMessage(content="a"), HumanMessage(content="b")]
     with pytest.raises(TrustGuardTransformError):
-        apply_transform_to_messages(messages, {"messages": [{"role": "user", "content": "only"}]})
+        apply_transform_to_messages(
+            messages, {"messages": [{"role": "user", "content": "only"}]}
+        )
 
 
 def test_unusable_transform_fails() -> None:
@@ -195,7 +208,11 @@ def test_non_array_tool_calls_fails() -> None:
     with pytest.raises(TrustGuardTransformError):
         apply_transform_to_messages(
             [original],
-            {"messages": [{"role": "assistant", "content": "", "tool_calls": {"id": "1"}}]},
+            {
+                "messages": [
+                    {"role": "assistant", "content": "", "tool_calls": {"id": "1"}}
+                ]
+            },
         )
 
 
@@ -216,7 +233,10 @@ def test_tool_calls_rewrite_preserves_id() -> None:
                         {
                             "id": "c1",
                             "type": "function",
-                            "function": {"name": "search", "arguments": '{"q": "[REDACTED]"}'},
+                            "function": {
+                                "name": "search",
+                                "arguments": '{"q": "[REDACTED]"}',
+                            },
                         }
                     ],
                 }
@@ -238,7 +258,10 @@ def test_apply_transform_to_tool_call() -> None:
                         {
                             "id": "c1",
                             "type": "function",
-                            "function": {"name": "search", "arguments": '{"q": "[REDACTED]"}'},
+                            "function": {
+                                "name": "search",
+                                "arguments": '{"q": "[REDACTED]"}',
+                            },
                         }
                     ],
                 }
@@ -296,7 +319,10 @@ def test_tool_call_omitted_id_keeps_original() -> None:
                     "tool_calls": [
                         {
                             "type": "function",
-                            "function": {"name": "search", "arguments": '{"q": "[REDACTED]"}'},
+                            "function": {
+                                "name": "search",
+                                "arguments": '{"q": "[REDACTED]"}',
+                            },
                         }
                     ],
                 }
@@ -316,7 +342,9 @@ def test_role_only_transform_fails() -> None:
 
 
 def test_mixed_media_text_block_fails() -> None:
-    original = HumanMessage(content=[{"type": "text", "text": "secret", "image_url": {"url": "x"}}])
+    original = HumanMessage(
+        content=[{"type": "text", "text": "secret", "image_url": {"url": "x"}}]
+    )
     with pytest.raises(TrustGuardTransformError):
         apply_transform_to_messages([original], {"input": "[REDACTED]"})
 
@@ -362,11 +390,164 @@ def test_null_content_transform_fails() -> None:
         )
 
 
+def test_list_content_extra_keys_fail() -> None:
+    original = HumanMessage(content=[{"type": "text", "text": "secret"}])
+    with pytest.raises(TrustGuardTransformError) as raised:
+        apply_transform_to_messages(
+            [original],
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "x", "jailbreak": True}],
+                    }
+                ]
+            },
+        )
+    assert raised.value.reason == "content_part_keys"
+
+
+def test_list_content_none_part_fails() -> None:
+    original = HumanMessage(content=[{"type": "text", "text": "secret"}])
+    with pytest.raises(TrustGuardTransformError):
+        apply_transform_to_messages(
+            [original],
+            {"messages": [{"role": "user", "content": [None]}]},
+        )
+
+
 def test_equal_length_list_content_applies() -> None:
     original = HumanMessage(content=[{"type": "text", "text": "secret"}], id="hm-1")
     rewritten = apply_transform_to_messages(
         [original],
-        {"messages": [{"role": "user", "content": [{"type": "text", "text": "[REDACTED]"}]}]},
+        {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "[REDACTED]"}]}
+            ]
+        },
     )
     assert rewritten[0].id == "hm-1"
     assert rewritten[0].content == [{"type": "text", "text": "[REDACTED]"}]
+
+
+def test_input_string_on_multi_message_span_fails() -> None:
+    messages = [
+        HumanMessage(content="my ssn is 123-45-6789"),
+        AIMessage(content="Noted."),
+        HumanMessage(content="continue"),
+    ]
+    with pytest.raises(TrustGuardTransformError):
+        apply_transform_to_messages(messages, {"input": "my ssn is [REDACTED]"})
+
+
+def test_longer_messages_array_fails() -> None:
+    messages = [HumanMessage(content="a"), HumanMessage(content="b")]
+    with pytest.raises(TrustGuardTransformError):
+        apply_transform_to_messages(
+            messages,
+            {
+                "messages": [
+                    {"role": "user", "content": "x"},
+                    {"role": "user", "content": "y"},
+                    {"role": "user", "content": "injected"},
+                ]
+            },
+        )
+
+
+def test_omitted_role_fails() -> None:
+    with pytest.raises(TrustGuardTransformError):
+        apply_transform_to_messages(
+            [HumanMessage(content="secret")],
+            {"messages": [{"content": "[REDACTED]"}]},
+        )
+
+
+def test_list_content_type_swap_fails() -> None:
+    original = HumanMessage(content=[{"type": "text", "text": "secret"}])
+    with pytest.raises(TrustGuardTransformError):
+        apply_transform_to_messages(
+            [original],
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "https://attacker.example/x.png"},
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+
+def test_list_content_tool_use_injection_fails() -> None:
+    original = HumanMessage(content=[{"type": "text", "text": "secret"}])
+    with pytest.raises(TrustGuardTransformError):
+        apply_transform_to_messages(
+            [original],
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_use",
+                                "id": "inj",
+                                "name": "rm_rf",
+                                "input": {},
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+
+def test_empty_original_tool_identity_fails() -> None:
+    original = AIMessage(
+        content="",
+        tool_calls=[{"name": "", "args": {"q": "x"}, "id": ""}],
+    )
+    with pytest.raises(TrustGuardTransformError):
+        apply_transform_to_messages(
+            [original],
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "dangerous",
+                                "type": "function",
+                                "function": {
+                                    "name": "rm_rf",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    }
+                ]
+            },
+        )
+
+
+def test_chat_message_uses_declared_role() -> None:
+    assert role_of(ChatMessage(content="hi", role="developer")) == "developer"
+
+
+def test_tool_result_indices_include_noncontiguous_tools() -> None:
+    messages = [
+        HumanMessage(content="hi"),
+        AIMessage(content="", tool_calls=[{"name": "search", "args": {}, "id": "c1"}]),
+        ToolMessage(content="one", tool_call_id="c1"),
+        HumanMessage(content="aside"),
+        ToolMessage(content="two", tool_call_id="c2"),
+    ]
+    assert tool_result_indices(messages) == (2, 4)
+    payload = extract_tool_results_payload(messages)
+    assert payload is not None
+    assert [item["content"] for item in payload["messages"]] == ["one", "two"]
