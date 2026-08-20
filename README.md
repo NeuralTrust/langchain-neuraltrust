@@ -4,19 +4,15 @@ LangChain 1.x middleware for [NeuralTrust TrustGuard](https://neuraltrust.ai). E
 
 ## Install
 
-From this repository:
-
 ```bash
-pip install -e .
+pip install langchain-neuraltrust
 ```
 
 or:
 
 ```bash
-uv add langchain-neuraltrust --git https://github.com/albertbausili/langchain-neuraltrust
+uv add langchain-neuraltrust
 ```
-
-`pip install langchain-neuraltrust` is the intended command after the first PyPI release. Until then, that name on PyPI is not this package.
 
 ## Configure
 

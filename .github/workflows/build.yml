@@ -1,5 +1,4 @@
-# Build smoke for tags and manual runs. Publishing to Artifact Registry is
-# wired in the NeuralTrust org via python-publish.yml once this repo moves.
+# Build the package on version tags, published GitHub Releases, and manual runs.
 
 name: Build
 

@@ -1,7 +1,6 @@
 # CI for PRs and default-branch pushes.
-# Uses NeuralTrust/workflows reusable jobs. This will not run from a personal
-# fork until the repo lives in the NeuralTrust org.
-# Workflows are pinned to a SHA of NeuralTrust/workflows@main.
+# Uses NeuralTrust/workflows reusable jobs, pinned to a SHA of
+# NeuralTrust/workflows@main.
 
 name: CI
 

@@ -31,9 +31,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/albertbausili/langchain-neuraltrust"
-Repository = "https://github.com/albertbausili/langchain-neuraltrust"
-Issues = "https://github.com/albertbausili/langchain-neuraltrust/issues"
+Homepage = "https://github.com/NeuralTrust/langchain-neuraltrust"
+Repository = "https://github.com/NeuralTrust/langchain-neuraltrust"
+Issues = "https://github.com/NeuralTrust/langchain-neuraltrust/issues"
 Documentation = "https://neuraltrust.ai"
 
 [dependency-groups]
