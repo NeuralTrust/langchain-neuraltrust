@@ -5,6 +5,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: [main, master, develop]
   pull_request:
@@ -23,6 +24,9 @@ permissions:
   contents: read
   pull-requests: write
   checks: read
+  security-events: write
+  actions: write
+  id-token: write
 
 jobs:
   lint:
