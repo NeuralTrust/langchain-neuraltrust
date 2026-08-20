@@ -6,6 +6,7 @@ import asyncio
 import ssl
 import threading
 import time
+import weakref
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any, cast
 
@@ -160,7 +161,9 @@ class TrustGuardClient:
         self._injected_sync = client
         self._injected_async = async_client
         self._owned_sync: httpx.Client | None = None
-        self._owned_async: dict[int, httpx.AsyncClient] = {}
+        self._owned_async: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, httpx.AsyncClient
+        ] = weakref.WeakKeyDictionary()
         self._sync_lock = threading.Lock()
 
     @property
@@ -208,7 +211,7 @@ class TrustGuardClient:
         if self._injected_async is not None:
             return
         pending = list(self._owned_async.values())
-        self._owned_async = {}
+        self._owned_async = weakref.WeakKeyDictionary()
         for client in pending:
             _close_async_client(client)
 
@@ -217,7 +220,7 @@ class TrustGuardClient:
         if self._injected_async is not None:
             return
         pending = list(self._owned_async.values())
-        self._owned_async = {}
+        self._owned_async = weakref.WeakKeyDictionary()
         for client in pending:
             if not client.is_closed:
                 await client.aclose()
@@ -238,11 +241,10 @@ class TrustGuardClient:
         if self._injected_async is not None:
             return self._injected_async
         loop = asyncio.get_running_loop()
-        key = id(loop)
-        client = self._owned_async.get(key)
+        client = self._owned_async.get(loop)
         if client is None or client.is_closed:
             client = httpx.AsyncClient(timeout=self.timeout)
-            self._owned_async[key] = client
+            self._owned_async[loop] = client
         return client
 
     def _retry_sync(self, send: Send) -> httpx.Response:

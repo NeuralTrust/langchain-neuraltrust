@@ -205,6 +205,7 @@ def test_tls_error_is_request_failed_not_unreachable() -> None:
 
 def test_async_client_is_recreated_for_a_new_event_loop() -> None:
     import asyncio
+    import gc
 
     client = _client()
 
@@ -212,9 +213,9 @@ def test_async_client_is_recreated_for_a_new_event_loop() -> None:
         return client._async_http()
 
     first = asyncio.run(grab())
+    gc.collect()
     second = asyncio.run(grab())
     assert first is not second
-    assert len(client._owned_async) == 2
 
 
 def test_connect_error_ssl_text_without_sslerror_is_unreachable() -> None:
