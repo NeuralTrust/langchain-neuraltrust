@@ -1,0 +1,27 @@
+# Prod publish — a GitHub Release (from auto-release.yml) publishes the wheel
+# to the PROD Artifact Registry.
+
+name: Release
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    uses: NeuralTrust/workflows/.github/workflows/python-publish.yml@ab9c0eda7ab13a6a7df5d04ecc048651c46c18cf
+    with:
+      gcp_project_id: ${{ vars.PROD_GCP_PROJECT_ID }}
+      build_tool: uv
+      python_version: "3.12"
+    secrets:
+      WIF_PROVIDER: ${{ secrets.PROD_WIF_PROVIDER }}
+      WIF_SERVICE_ACCOUNT: ${{ secrets.PROD_WIF_SERVICE_ACCOUNT }}

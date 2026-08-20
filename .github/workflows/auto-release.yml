@@ -1,0 +1,34 @@
+# Auto-release on the default branch.
+# AI semver bump, writes hatch's _version.py, creates a GitHub Release.
+# The release event then triggers release.yml to publish to PROD Artifact Registry.
+#
+# .github changes are ignored so workflow-only pushes do not cut a release.
+
+name: Auto Release
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - ".github/**"
+      - "README.md"
+
+concurrency:
+  group: auto-release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    uses: NeuralTrust/workflows/.github/workflows/ai-release-bump.yml@ab9c0eda7ab13a6a7df5d04ecc048651c46c18cf
+    with:
+      initial_version: v0.1.0
+      update_changelog: false
+      version_update_script: |
+        sed -i 's/^__version__ = "[^"]*"/__version__ = "'"$VERSION"'"/' langchain_neuraltrust/_version.py
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
