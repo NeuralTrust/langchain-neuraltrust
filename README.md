@@ -1,6 +1,6 @@
 # langchain-neuraltrust
 
-LangChain 1.x middleware for [NeuralTrust TrustGuard](https://neuraltrust.ai). Evaluates agent input, model output, and optionally tool traffic with `POST /v1/evaluate`.
+LangChain 1.x middleware for [NeuralTrust TrustGuard](https://docs.neuraltrust.ai/trustguard/overview). Evaluates agent input, model output, and optionally tool traffic with `POST /v1/evaluate`.
 
 ## Install
 
@@ -53,7 +53,7 @@ Call `close()` after `invoke`, or `await aclose()` after `ainvoke`, when the mid
 | TrustGuard | Middleware |
 |---|---|
 | `allow` | Continue |
-| `report` | Continue. Fires `on_violation` and stores findings on `additional_kwargs["trustguard"]` |
+| `report` | Continue. Fires `on_violation`. On the hook stages it also stores findings on `additional_kwargs["trustguard"]`; on the `check_tool_calls` stage there is no message to write to, so `on_violation` is the only signal |
 | `block` | Honors `exit_behavior` |
 | `transform` | Rewrites the matching messages **preserving `message.id`** so LangChain replaces instead of appending |
 
@@ -69,9 +69,11 @@ Call `close()` after `invoke`, or `await aclose()` after `ainvoke`, when the mid
 
 ## Fail-closed
 
-`unreachable_fallback` applies only to connect errors, timeouts, HTTP 502/504, and HTTP 429 after retries are exhausted. Those statuses are retried with backoff (honoring `Retry-After` when present) before the fallback is applied.
+`unreachable_fallback` applies only to plain connect errors, timeouts, HTTP 502/504, and HTTP 429 after retries are exhausted. Those statuses are retried with backoff (honoring `Retry-After` when present) before the fallback is applied.
 
-HTTP 401/403, 503 entitlements, other 4xx/5xx, non-JSON 200, unknown verdicts, and unusable transforms always fail closed — including when `unreachable_fallback="fail_open"`.
+HTTP 401/403, 503 entitlements, other 4xx/5xx, non-JSON 200, unknown verdicts, unusable transforms, and TLS failures always fail closed — including when `unreachable_fallback="fail_open"`.
+
+A TLS failure is technically a connect error, but an untrusted or expired certificate is treated as a configuration fault rather than an outage, so `fail_open` does not cover it. A corporate MITM proxy without a trusted CA blocks every turn even with `fail_open` set.
 
 Transforms fail closed when they:
 
