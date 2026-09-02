@@ -34,7 +34,7 @@ dependencies = [
 Homepage = "https://github.com/NeuralTrust/langchain-neuraltrust"
 Repository = "https://github.com/NeuralTrust/langchain-neuraltrust"
 Issues = "https://github.com/NeuralTrust/langchain-neuraltrust/issues"
-Documentation = "https://neuraltrust.ai"
+Documentation = "https://docs.neuraltrust.ai/trustguard/integrations/langchain"
 
 [dependency-groups]
 test = [
