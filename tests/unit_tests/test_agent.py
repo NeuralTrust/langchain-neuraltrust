@@ -73,23 +73,16 @@ def test_create_agent_stops_on_block() -> None:
     assert unused.content == "should not run"
 
 
-@pytest.mark.parametrize(
-    "findings",
-    [_SKIP_FINDINGS, _REPORT_THEN_SKIP_FINDINGS],
-    ids=["skip", "skip_with_earlier_report"],
-)
 @pytest.mark.parametrize("exit_behavior", ["end", "error"])
 @respx.mock
-def test_create_agent_skip_passes_turn(
-    findings: list[dict[str, object]], exit_behavior: str
-) -> None:
+def test_create_agent_skip_passes_turn(exit_behavior: str) -> None:
     respx.post(URL).mock(
         return_value=httpx.Response(
             200,
             json={
                 "status": "skip",
                 "transformed_payload": None,
-                "findings": findings,
+                "findings": _SKIP_FINDINGS,
                 "trace_id": "tr-skip",
                 "request_id": "rq-skip",
             },
@@ -112,6 +105,47 @@ def test_create_agent_skip_passes_turn(
     result = agent.invoke({"messages": [HumanMessage(content="What is 2+2?")]})
     assert result["messages"][0].content == "What is 2+2?"
     assert "trustguard" not in result["messages"][0].additional_kwargs
+    assert result["messages"][-1].content == "MODEL ANSWER: hello there"
+    assert seen == []
+
+
+@pytest.mark.parametrize("exit_behavior", ["end", "error"])
+@respx.mock
+def test_create_agent_skip_after_report_keeps_findings(exit_behavior: str) -> None:
+    respx.post(URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "skip",
+                "transformed_payload": None,
+                "findings": _REPORT_THEN_SKIP_FINDINGS,
+                "trace_id": "tr-skip",
+                "request_id": "rq-skip",
+            },
+        )
+    )
+    seen: list[str] = []
+    model = GenericFakeChatModel(
+        messages=iter([AIMessage(content="MODEL ANSWER: hello there")])
+    )
+    agent = create_agent(
+        model=model,
+        middleware=[
+            _mw(
+                exit_behavior=exit_behavior,
+                on_violation=lambda verdict, _stage: seen.append(verdict.status),
+            )
+        ],
+        tools=[],
+    )
+    human = HumanMessage(content="What is 2+2?", id="hm-1")
+    result = agent.invoke({"messages": [human]})
+    updated = next(message for message in result["messages"] if message.id == "hm-1")
+    assert updated.content == "What is 2+2?"
+    assert updated.additional_kwargs["trustguard"]["status"] == "skip"
+    assert (
+        updated.additional_kwargs["trustguard"]["findings"] == _REPORT_THEN_SKIP_FINDINGS
+    )
     assert result["messages"][-1].content == "MODEL ANSWER: hello there"
     assert seen == []
 

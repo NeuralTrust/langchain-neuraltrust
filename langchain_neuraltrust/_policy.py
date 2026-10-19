@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from langgraph.errors import GraphBubbleUp
@@ -43,10 +44,31 @@ def block_text(verdict: TrustGuardVerdict) -> str:
     return BLOCKED
 
 
+def _contains_report_finding(findings: object) -> bool:
+    """Return whether a Skip response still carries an earlier Report finding."""
+    if not isinstance(findings, list):
+        return False
+    for finding in findings:
+        if not isinstance(finding, Mapping):
+            continue
+        outcome = finding.get("outcome")
+        if isinstance(outcome, Mapping) and outcome.get("action") == STATUS_REPORT:
+            return True
+    return False
+
+
 def classify_verdict(verdict: TrustGuardVerdict) -> Outcome:
-    """Map a parsed evaluate body onto one outcome."""
+    """Map a parsed evaluate body onto one outcome.
+
+    ``skip`` continues like ``allow``. When a Report finding is already in that
+    response, the findings are recorded and ``on_violation`` is not fired.
+    """
     status = verdict.status
-    if status in {STATUS_ALLOW, STATUS_SKIP}:
+    if status == STATUS_ALLOW:
+        return Outcome(kind="allow", verdict=verdict)
+    if status == STATUS_SKIP:
+        if _contains_report_finding(verdict.findings):
+            return Outcome(kind="report", verdict=verdict, fire=False)
         return Outcome(kind="allow", verdict=verdict)
     if status == STATUS_REPORT:
         return Outcome(kind="report", verdict=verdict, fire=True)
