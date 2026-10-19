@@ -146,6 +146,65 @@ def test_report_fires_callback_and_attaches_metadata() -> None:
     assert updated.id == "hm-1"
     assert updated.additional_kwargs["trustguard"]["status"] == "report"
     assert updated.additional_kwargs["trustguard"]["trace_id"] == "tr-r"
+    assert updated.additional_kwargs["trustguard"]["findings"] == [{"id": 1}]
+
+
+_SKIP_FINDING: dict[str, object] = {
+    "source": {"kind": "gate", "gate_name": "Skip internal health checks"},
+    "signal": {"type": "gate_skip"},
+    "outcome": {"action": "skip"},
+}
+_REPORT_FINDING: dict[str, object] = {
+    "source": {"kind": "gate", "gate_name": "Report internal consumers"},
+    "signal": {"type": "gate_report"},
+    "outcome": {"action": "report"},
+}
+
+
+@respx.mock
+def test_skip_input_returns_none_without_callback() -> None:
+    seen: list[str] = []
+    respx.post(URL).mock(
+        return_value=_status("skip", findings=[_SKIP_FINDING], trace_id="tr-s")
+    )
+    result = _mw(
+        on_violation=lambda verdict, _stage: seen.append(verdict.status)
+    ).before_model(
+        _state(HumanMessage(content="hi", id="hm-1")),
+        runtime=None,  # type: ignore[arg-type]
+    )
+    assert result is None
+    assert seen == []
+
+
+@respx.mock
+def test_skip_after_report_stores_findings_without_callback() -> None:
+    seen: list[str] = []
+    findings = [_REPORT_FINDING, _SKIP_FINDING]
+    respx.post(URL).mock(
+        return_value=_status(
+            "skip", findings=findings, trace_id="tr-s", request_id="rq-s"
+        )
+    )
+    human = HumanMessage(content="hi", id="hm-1")
+    result = _mw(
+        on_violation=lambda verdict, _stage: seen.append(verdict.status)
+    ).before_model(
+        _state(human),
+        runtime=None,  # type: ignore[arg-type]
+    )
+    assert seen == []
+    assert result is not None
+    assert "jump_to" not in result
+    updated = result["messages"][0]
+    assert updated.id == "hm-1"
+    assert updated.content == "hi"
+    assert updated.additional_kwargs["trustguard"] == {
+        "status": "skip",
+        "trace_id": "tr-s",
+        "request_id": "rq-s",
+        "findings": findings,
+    }
 
 
 @respx.mock

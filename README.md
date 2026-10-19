@@ -53,7 +53,7 @@ Call `close()` after `invoke`, or `await aclose()` after `ainvoke`, when the mid
 | TrustGuard | Middleware |
 |---|---|
 | `allow` | Continue |
-| `skip` | Continue untouched |
+| `skip` | Continue untouched. An earlier Report finding is stored on `additional_kwargs["trustguard"]` and does not fire `on_violation` |
 | `report` | Continue. Fires `on_violation` and stores findings on `additional_kwargs["trustguard"]` |
 | `block` | Honors `exit_behavior` |
 | `transform` | Rewrites the matching messages **preserving `message.id`** so LangChain replaces instead of appending |
