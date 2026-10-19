@@ -15,15 +15,16 @@ STATUS_ALLOW: Final = "allow"
 STATUS_BLOCK: Final = "block"
 STATUS_TRANSFORM: Final = "transform"
 STATUS_REPORT: Final = "report"
+STATUS_SKIP: Final = "skip"
 
 KNOWN_STATUSES: Final = frozenset(
-    {STATUS_ALLOW, STATUS_BLOCK, STATUS_TRANSFORM, STATUS_REPORT}
+    {STATUS_ALLOW, STATUS_BLOCK, STATUS_TRANSFORM, STATUS_REPORT, STATUS_SKIP}
 )
 UNREACHABLE_HTTP_STATUSES: Final = frozenset({502, 504})
 RETRYABLE_HTTP_STATUSES: Final = frozenset({429, 502, 504})
 AUTH_HTTP_STATUSES: Final = frozenset({401, 403})
 
-TrustGuardStatus = Literal["allow", "block", "transform", "report"]
+TrustGuardStatus = Literal["allow", "block", "transform", "report", "skip"]
 ExitBehavior = Literal["end", "error", "replace"]
 UnreachableFallback = Literal["fail_closed", "fail_open"]
 EvaluateDirection = Literal["input", "output"]

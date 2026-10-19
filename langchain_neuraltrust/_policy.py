@@ -12,6 +12,7 @@ from langchain_neuraltrust._types import (
     STATUS_ALLOW,
     STATUS_BLOCK,
     STATUS_REPORT,
+    STATUS_SKIP,
     STATUS_TRANSFORM,
     UNKNOWN_VERDICT,
     UNREACHABLE,
@@ -45,7 +46,7 @@ def block_text(verdict: TrustGuardVerdict) -> str:
 def classify_verdict(verdict: TrustGuardVerdict) -> Outcome:
     """Map a parsed evaluate body onto one outcome."""
     status = verdict.status
-    if status == STATUS_ALLOW:
+    if status in {STATUS_ALLOW, STATUS_SKIP}:
         return Outcome(kind="allow", verdict=verdict)
     if status == STATUS_REPORT:
         return Outcome(kind="report", verdict=verdict, fire=True)
