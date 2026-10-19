@@ -20,6 +20,32 @@ from langchain_neuraltrust._types import (
 
 URL = "https://trustguard.neuraltrust.ai/v1/evaluate"
 
+_SKIP_FINDINGS: list[dict[str, object]] = [
+    {
+        "source": {
+            "kind": "gate",
+            "gate_name": "Skip internal health checks",
+            "gate_id": "2b9c7e14-58a1-4f3d-b6e2-91d0c4a7f385",
+            "policy_id": "7d1f9a52-3c4e-4b8a-9f21-6a0c5e8d2b17",
+        },
+        "signal": {"type": "gate_skip"},
+        "outcome": {"action": "skip"},
+    }
+]
+_REPORT_THEN_SKIP_FINDINGS: list[dict[str, object]] = [
+    {
+        "source": {
+            "kind": "gate",
+            "gate_name": "Report internal consumers",
+            "gate_id": "c41e8b2d-7f60-4a95-8d3c-5e2b1a9f0c64",
+            "policy_id": "7d1f9a52-3c4e-4b8a-9f21-6a0c5e8d2b17",
+        },
+        "signal": {"type": "gate_report"},
+        "outcome": {"action": "report"},
+    },
+    *_SKIP_FINDINGS,
+]
+
 
 def _client() -> TrustGuardClient:
     return TrustGuardClient(
@@ -150,8 +176,34 @@ def test_json_array_200_is_unknown_verdict() -> None:
 
 
 @respx.mock
-def test_unknown_status_is_unknown_verdict() -> None:
-    respx.post(URL).mock(return_value=httpx.Response(200, json={"status": "maybe"}))
+@pytest.mark.parametrize(
+    "findings",
+    [_SKIP_FINDINGS, _REPORT_THEN_SKIP_FINDINGS],
+    ids=["skip", "skip_with_earlier_report"],
+)
+def test_skip_status_is_accepted(findings: list[dict[str, object]]) -> None:
+    respx.post(URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "status": "skip",
+                "transformed_payload": None,
+                "findings": findings,
+                "trace_id": "tr-skip",
+                "request_id": "rq-skip",
+            },
+        )
+    )
+    verdict = _client().evaluate(_body())
+    assert verdict.status == "skip"
+    assert verdict.findings == findings
+    assert verdict.trace_id == "tr-skip"
+
+
+@pytest.mark.parametrize("status", ["maybe", "ask"])
+@respx.mock
+def test_unknown_status_is_unknown_verdict(status: str) -> None:
+    respx.post(URL).mock(return_value=httpx.Response(200, json={"status": status}))
     with pytest.raises(TrustGuardUnknownVerdictError, match=UNKNOWN_VERDICT):
         _client().evaluate(_body())
 
